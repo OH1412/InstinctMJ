@@ -1863,3 +1863,172 @@ def random_multi_box_terrain(
     output = TerrainOutput(origin=origin, geometries=geometries, flat_patches=flat_patches)
     output.instinct_surface_mesh = surface_mesh
     return output
+
+
+def corridor_terrain(
+    cfg: mesh_terrains_cfg.MeshCorridorTerrainCfg,
+    difficulty: float,
+    spec: mujoco.MjSpec,
+    rng: np.random.Generator,
+) -> TerrainOutput:
+    """Generate the HMV stair corridor from native MuJoCo box geoms."""
+    body = spec.body("terrain")
+    geometries: list[TerrainGeometry] = []
+    surface_meshes: list[trimesh.Trimesh] = []
+    platform_centers: list[np.ndarray] = []
+
+    def add_box(extents, transform) -> None:
+        extents_arr = np.asarray(extents, dtype=np.float64)
+        transform_arr = np.asarray(transform, dtype=np.float64)
+        xyzw = tf.Rotation.from_matrix(transform_arr[:3, :3]).as_quat()
+        quat = (float(xyzw[3]), float(xyzw[0]), float(xyzw[1]), float(xyzw[2]))
+        geom = body.add_geom(
+            type=mujoco.mjtGeom.mjGEOM_BOX,
+            size=tuple((0.5 * extents_arr).tolist()),
+            pos=tuple(transform_arr[:3, 3].tolist()),
+            quat=quat,
+        )
+        geometries.append(TerrainGeometry(geom=geom))
+        surface_meshes.append(trimesh.creation.box(extents=extents_arr, transform=transform_arr))
+
+    width, length = cfg.size
+    floor_thickness = 0.01
+    add_box(
+        (width, length, floor_thickness),
+        trimesh.transformations.translation_matrix((0.5 * width, 0.5 * length, 0.5 * floor_thickness)),
+    )
+
+    target_step_height = float(np.interp(difficulty, (0.0, 1.0), cfg.step_height_range))
+    num_steps = max(1, int(round(cfg.rise_per_stair / target_step_height)))
+    step_height = cfg.rise_per_stair / num_steps
+    while step_height > cfg.step_height_range[1]:
+        num_steps += 1
+        step_height = cfg.rise_per_stair / num_steps
+    tread_easy, tread_hard = cfg.step_tread_range[1], cfg.step_tread_range[0]
+    step_length = float(np.interp(difficulty, (0.0, 1.0), (tread_easy, tread_hard)))
+    stair_run = step_length * num_steps
+    stair_rise = step_height * num_steps
+
+    def add_stairs(cursor: np.ndarray, wall_side: float | None) -> None:
+        for index in range(num_steps):
+            local = trimesh.transformations.translation_matrix(
+                (step_length * (index + 0.5), 0.0, step_height * (index + 0.5))
+            )
+            add_box((step_length, cfg.corridor_width, step_height), cursor @ local)
+        if wall_side is not None:
+            wall_y = wall_side * (0.5 * cfg.corridor_width + 0.5 * cfg.wall_thickness)
+            wall_total_height = stair_rise + cfg.wall_height
+            local = trimesh.transformations.translation_matrix((0.5 * stair_run, wall_y, 0.5 * wall_total_height))
+            add_box((stair_run, cfg.wall_thickness, wall_total_height), cursor @ local)
+        guard_side = -wall_side if wall_side is not None else 1.0
+        rail_y = guard_side * (0.5 * cfg.corridor_width - 0.5 * cfg.stair_guardrail_thickness)
+        rail_length = float(np.hypot(stair_run, stair_rise))
+        rail_pitch = -float(np.arctan2(stair_rise, stair_run))
+        local = (
+            trimesh.transformations.translation_matrix(
+                (0.5 * stair_run, rail_y, cfg.stair_guardrail_height + 0.5 * stair_rise)
+            )
+            @ trimesh.transformations.rotation_matrix(rail_pitch, (0.0, 1.0, 0.0))
+        )
+        add_box(
+            (rail_length, cfg.stair_guardrail_thickness, cfg.stair_guardrail_thickness),
+            cursor @ local,
+        )
+
+    def add_platform(cursor: np.ndarray, platform_length: float, platform_width: float, front_wall: bool) -> None:
+        floor = trimesh.transformations.translation_matrix((0.5 * platform_length, 0.0, 0.5 * step_height))
+        floor_transform = cursor @ floor
+        add_box((platform_length, platform_width, step_height), floor_transform)
+        platform_center = floor_transform[:3, 3].copy()
+        platform_center[2] += 0.5 * step_height
+        platform_centers.append(platform_center)
+        for side in (-1.0, 1.0):
+            wall_y = side * (0.5 * platform_width + 0.5 * cfg.wall_thickness)
+            wall = trimesh.transformations.translation_matrix(
+                (0.5 * platform_length, wall_y, step_height + 0.5 * cfg.wall_height)
+            )
+            add_box((platform_length, cfg.wall_thickness, cfg.wall_height), cursor @ wall)
+        if front_wall:
+            wall = trimesh.transformations.translation_matrix(
+                (platform_length + 0.5 * cfg.wall_thickness, 0.0, step_height + 0.5 * cfg.wall_height)
+            )
+            add_box((cfg.wall_thickness, platform_width, cfg.wall_height), cursor @ wall)
+
+    cursor = trimesh.transformations.translation_matrix((0.5 * width, 0.5 * length, 0.0))
+    aliases = {"left_turn": "left", "right_turn": "right"}
+    components = [aliases.get(name, name) for name in cfg.component_types]
+    u_turn_side = cfg.first_u_turn_side
+    for segment_index in range(cfg.segment_count):
+        component = str(rng.choice(components))
+        if component == "u_turn" and u_turn_side is None:
+            u_turn_side = float(rng.choice((-1.0, 1.0)))
+        turn_degrees = {"left": 90.0, "right": -90.0, "straight": 0.0, "u_turn": 180.0}[component]
+        wall_side = (
+            -1.0 if component == "left" else 1.0 if component == "right" else -float(u_turn_side or 1.0)
+        )
+        if segment_index == 0:
+            add_stairs(cursor, wall_side)
+            cursor = cursor @ trimesh.transformations.translation_matrix((stair_run, 0.0, stair_rise))
+
+        platform_length = cfg.u_turn_platform_length if component == "u_turn" else cfg.platform_length
+        platform_width = 2.0 * cfg.corridor_width if component == "u_turn" else cfg.corridor_width
+        if not (component == "straight" and cfg.straight_skip_mid_platform):
+            platform_cursor = cursor
+            if component == "u_turn":
+                platform_cursor = platform_cursor @ trimesh.transformations.translation_matrix(
+                    (0.0, float(u_turn_side or 1.0) * 0.5 * cfg.corridor_width, 0.0)
+                )
+            add_platform(platform_cursor, platform_length, platform_width, component != "straight")
+            cursor = cursor @ trimesh.transformations.translation_matrix((platform_length, 0.0, 0.0))
+
+        cursor = cursor @ trimesh.transformations.rotation_matrix(np.deg2rad(turn_degrees), (0.0, 0.0, 1.0))
+        add_stairs(cursor, wall_side)
+        cursor = cursor @ trimesh.transformations.translation_matrix((stair_run, 0.0, stair_rise))
+        if segment_index == cfg.segment_count - 1:
+            add_platform(cursor, cfg.platform_length, cfg.corridor_width, True)
+
+    perimeter_specs = (
+        (
+            cfg.wall_prob[0],
+            (cfg.wall_thickness, length, cfg.perimeter_wall_height),
+            (-0.5 * cfg.wall_thickness, 0.5 * length),
+        ),
+        (
+            cfg.wall_prob[1],
+            (cfg.wall_thickness, length, cfg.perimeter_wall_height),
+            (width + 0.5 * cfg.wall_thickness, 0.5 * length),
+        ),
+        (
+            cfg.wall_prob[2],
+            (width, cfg.wall_thickness, cfg.perimeter_wall_height),
+            (0.5 * width, -0.5 * cfg.wall_thickness),
+        ),
+        (
+            cfg.wall_prob[3],
+            (width, cfg.wall_thickness, cfg.perimeter_wall_height),
+            (0.5 * width, length + 0.5 * cfg.wall_thickness),
+        ),
+    )
+    for probability, extents, (x, y) in perimeter_specs:
+        if rng.uniform() < probability:
+            add_box(
+                extents,
+                trimesh.transformations.translation_matrix((x, y, 0.5 * cfg.perimeter_wall_height)),
+            )
+
+    origin = np.array((0.5 * width, 0.5 * length, 0.0), dtype=np.float64)
+    flat_patches: dict[str, np.ndarray] | None = None
+    if cfg.flat_patch_sampling is not None:
+        # PoseVelocityCommand requires target patches.  Reuse the final corridor
+        # platform as the navigation goal instead of sampling the open floor or
+        # the top of a perimeter wall.
+        if len(platform_centers) == 0:
+            raise RuntimeError("Corridor terrain did not generate a target platform.")
+        final_platform = platform_centers[-1]
+        flat_patches = {
+            name: np.repeat(final_platform[None, :], patch_cfg.num_patches, axis=0)
+            for name, patch_cfg in cfg.flat_patch_sampling.items()
+        }
+    output = TerrainOutput(origin=origin, geometries=geometries, flat_patches=flat_patches)
+    output.instinct_surface_mesh = trimesh.util.concatenate(surface_meshes)
+    return output

@@ -509,6 +509,7 @@ class GroupedRayCaster(RayCastSensor):
 
             if (
                 entity_lower in {"terrain", "ground"}
+                or local_body_name.lower() in {"terrain", "ground"}
                 or "ground" in full_body_name.lower()
                 or "ground" in full_geom_name.lower()
             ):

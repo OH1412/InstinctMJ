@@ -4,8 +4,8 @@ from typing import List
 import mujoco
 import numpy as np
 from mjlab.terrains import SubTerrainCfg as SubTerrainBaseCfg
-from instinct_mj.terrains.height_field.hf_terrains_cfg import PerlinPlaneTerrainCfg
 
+from instinct_mj.terrains.height_field.hf_terrains_cfg import PerlinPlaneTerrainCfg
 
 from . import mesh_terrains
 
@@ -17,6 +17,33 @@ class WallTerrainCfgMixin:
     )  # Probability of generating walls on [left, right, front, back] sides
     wall_height: float = 5.0  # Height of the walls
     wall_thickness: float = 0.05  # Thickness of the walls
+
+
+@dataclass(kw_only=True)
+class MeshCorridorTerrainCfg(SubTerrainBaseCfg):
+    """Stair-and-platform corridor used by Humanoid Monument Valley."""
+
+    corridor_width: float = 1.25
+    wall_height: float = 1.5
+    perimeter_wall_height: float = 8.0
+    wall_thickness: float = 0.2
+    stair_guardrail_height: float = 1.0
+    stair_guardrail_thickness: float = 0.08
+    wall_prob: list[float] = field(default_factory=lambda: [1.0, 1.0, 1.0, 1.0])
+    platform_length: float = 1.5
+    u_turn_platform_length: float = 1.3
+    segment_count: int = 2
+    rise_per_stair: float = 2.0
+    step_height_range: tuple[float, float] = (0.15, 0.20)
+    step_tread_range: tuple[float, float] = (0.17, 0.25)
+    component_types: list[str] = field(default_factory=lambda: ["u_turn"])
+    first_u_turn_side: float | None = None
+    straight_skip_mid_platform: bool = False
+    enable_mid_platform_spawn: bool = True
+
+    def function(self, difficulty: float, spec: mujoco.MjSpec, rng: np.random.Generator):
+        return mesh_terrains.corridor_terrain(self, difficulty, spec, rng)
+
 
 @dataclass(kw_only=True)
 class PerlinMeshRandomMultiBoxTerrainCfg(SubTerrainBaseCfg, WallTerrainCfgMixin):

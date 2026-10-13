@@ -2,8 +2,16 @@ from dataclasses import dataclass
 from typing import Literal
 
 from mjlab.terrains import TerrainGeneratorCfg as TerrainGeneratorCfgBase
+from mjlab.terrains import FlatPatchSamplingCfg as FlatPatchSamplingCfgBase
 
 from .terrain_generator import FiledTerrainGenerator
+
+
+@dataclass
+class FlatPatchSamplingCfg(FlatPatchSamplingCfgBase):
+    """Parkour flat-patch sampler supporting multiple footprint radii."""
+
+    patch_radius: float | list[float] | tuple[float, ...] = 0.5
 
 
 @dataclass(kw_only=True)

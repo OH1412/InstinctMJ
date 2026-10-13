@@ -14,7 +14,28 @@ __file_dir__ = os.path.dirname(os.path.realpath(__file__))
 # MJCF (XML) path – uses the local 29-dof torso-base popsicle model.
 # Joint-related semantics in this module follow the MuJoCo/MJCF native order.
 G1_MJCF_PATH: str = os.path.join(__file_dir__, "resources/unitree_g1/xml/g1_29dof_torsobase_popsicle.xml")
+G1_31DOF_D455_MJCF_PATH: str = os.path.join(__file_dir__, "resources/unitree_g1/xml/g1_31dof_d455.xml")
 G1_MESHES_DIR: str = os.path.join(__file_dir__, "resources/unitree_g1/meshes")
+
+G1_31DOF_D455_POLICY_JOINT_NAMES = (
+    "left_shoulder_pitch_joint", "right_shoulder_pitch_joint", "waist_pitch_joint",
+    "left_shoulder_roll_joint", "right_shoulder_roll_joint", "waist_roll_joint",
+    "left_shoulder_yaw_joint", "right_shoulder_yaw_joint", "waist_yaw_joint",
+    "left_elbow_joint", "right_elbow_joint", "left_hip_pitch_joint", "right_hip_pitch_joint",
+    "left_wrist_roll_joint", "right_wrist_roll_joint", "left_hip_roll_joint", "right_hip_roll_joint",
+    "left_wrist_pitch_joint", "right_wrist_pitch_joint", "left_hip_yaw_joint", "right_hip_yaw_joint",
+    "left_wrist_yaw_joint", "right_wrist_yaw_joint", "left_knee_joint", "right_knee_joint",
+    "left_ankle_pitch_joint", "right_ankle_pitch_joint", "left_ankle_roll_joint", "right_ankle_roll_joint",
+)
+G1_31DOF_D455_CAMERA_JOINT_NAMES = ("head_yaw_joint", "head_pitch_joint")
+G1_31DOF_D455_CAMERA_YAW_RANGE = (-0.8727, 0.8727)
+G1_31DOF_D455_CAMERA_PITCH_RANGE = (-0.2671975511965976, 0.5)
+G1_31DOF_D455_CAMERA_PITCH_DEFAULT = -0.09266462599716477
+G1_31DOF_D455_DEPTH_FOV = (86.0, 57.0)
+G1_31DOF_D455_DEPTH_MIN_DISTANCE = 0.4
+G1_31DOF_D455_DEPTH_NORMALIZATION_RANGE = (0.4, 2.5)
+G1_31DOF_D455_FLAT_FORWARD_PITCH_TARGET = 0.15913414907068767
+G1_31DOF_D455_ROUGH_DOWNWARD_PITCH_TARGET = -0.2
 
 """
 joint name order:
@@ -59,6 +80,11 @@ joint name order:
 def get_g1_spec() -> mujoco.MjSpec:
     """Load the local g1_29dof_torsobase_popsicle.xml as MjSpec."""
     return mujoco.MjSpec.from_file(G1_MJCF_PATH)
+
+
+def get_g1_31dof_d455_spec() -> mujoco.MjSpec:
+    """Load the HMV G1 body with the two-axis D455 head gimbal."""
+    return mujoco.MjSpec.from_file(G1_31DOF_D455_MJCF_PATH)
 
 
 # Initial state matching InstinctLab G1_29DOF_TORSOBASE_CFG (simplified variant).
@@ -439,6 +465,22 @@ beyondmimic_g1_29dof_delayed_actuator_cfgs: tuple[ActuatorCfg, ...] = (
     BEYONDMIMIC_G1_29DOF_DELAYED_ARMS_4010,
 )
 
+G1_31DOF_D455_DELAYED_HEAD = BuiltinPdActuatorCfg(
+    target_names_expr=G1_31DOF_D455_CAMERA_JOINT_NAMES,
+    effort_limit=9.0,
+    stiffness=20.0,
+    damping=1.0,
+    armature=0.003,
+    delay_min_lag=0,
+    delay_max_lag=2,
+    delay_update_period=_BEYONDMIMIC_DELAY_RESET_ONLY_PERIOD_ARMS,
+    delay_per_env_phase=False,
+)
+G1_31DOF_D455_DELAYED_ACTUATOR_CFGS: tuple[ActuatorCfg, ...] = (
+    *beyondmimic_g1_29dof_delayed_actuator_cfgs,
+    G1_31DOF_D455_DELAYED_HEAD,
+)
+
 
 G1_29DOF_TORSOBASE_CFG = EntityCfg(
     init_state=copy.deepcopy(_SIMPLIFIED_INIT_STATE),
@@ -461,6 +503,18 @@ G1_29DOF_TORSOBASE_POPSICLE_CFG = EntityCfg(
     spec_fn=get_g1_spec,
     articulation=EntityArticulationInfoCfg(
         actuators=tuple(copy.deepcopy(act) for act in beyondmimic_g1_29dof_actuator_cfgs),
+        soft_joint_pos_limit_factor=0.9,
+    ),
+)
+
+_G1_31DOF_D455_INIT_STATE = copy.deepcopy(_POPSICLE_INIT_STATE)
+_G1_31DOF_D455_INIT_STATE.joint_pos["head_yaw_joint"] = 0.0
+_G1_31DOF_D455_INIT_STATE.joint_pos["head_pitch_joint"] = G1_31DOF_D455_CAMERA_PITCH_DEFAULT
+G1_31DOF_D455_CFG = EntityCfg(
+    init_state=_G1_31DOF_D455_INIT_STATE,
+    spec_fn=get_g1_31dof_d455_spec,
+    articulation=EntityArticulationInfoCfg(
+        actuators=tuple(copy.deepcopy(act) for act in G1_31DOF_D455_DELAYED_ACTUATOR_CFGS),
         soft_joint_pos_limit_factor=0.9,
     ),
 )
@@ -530,6 +584,26 @@ G1_29Dof_TorsoBase_symmetric_augmentation_joint_reverse_buf = [
     -1,  # right wrist yaw
 ]
 
+# Native MuJoCo order is the original 15 waist/leg joints, the two head
+# joints, then the original 14 arm joints.
+G1_31DOF_D455_SYMMETRIC_JOINT_MAPPING = [
+    *(index if index < 15 else index + 2 for index in G1_29Dof_TorsoBase_symmetric_augmentation_joint_mapping[:15]),
+    15,
+    16,
+    *(index + 2 for index in G1_29Dof_TorsoBase_symmetric_augmentation_joint_mapping[15:]),
+]
+G1_31DOF_D455_SYMMETRIC_JOINT_REVERSE = [
+    *G1_29Dof_TorsoBase_symmetric_augmentation_joint_reverse_buf[:15],
+    -1,
+    1,
+    *G1_29Dof_TorsoBase_symmetric_augmentation_joint_reverse_buf[15:],
+]
+G1_31DOF_D455_JOINT_VELOCITY_LIMITS = {
+    **G1_29DOF_JOINT_VELOCITY_LIMITS,
+    "head_yaw_joint": 5.0,
+    "head_pitch_joint": 5.0,
+}
+
 # Ray-target helper uses membership only, but keep mjlab/MJCF body order here so
 # any downstream debugging or config dumps match the current MuJoCo asset.
 
@@ -541,6 +615,8 @@ for actuator_cfg in beyondmimic_g1_29dof_actuator_cfgs:
         continue
     for joint_expr in actuator_cfg.target_names_expr:
         beyondmimic_action_scale[joint_expr] = 0.25 * effort / stiffness
+
+G1_31DOF_D455_ACTION_SCALE = dict(beyondmimic_action_scale)
 
 
 __all__ = [

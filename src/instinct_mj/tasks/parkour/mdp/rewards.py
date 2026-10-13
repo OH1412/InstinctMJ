@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import math
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 import torch
-from mjlab.managers import RewardTermCfg, SceneEntityCfg
+from mjlab.managers import ManagerTermBase, RewardTermCfg, SceneEntityCfg
 from mjlab.sensor import ContactSensor, RayCastSensor
 from mjlab.utils.lab_api.math import quat_apply_inverse
 from mjlab.utils.lab_api.string import resolve_matching_names_values
@@ -45,6 +47,291 @@ def track_ang_vel_z_exp(
     command = env.command_manager.get_command(command_name)
     ang_vel_error = torch.square(command[:, 2] - asset.data.root_link_ang_vel_b[:, 2])
     return torch.exp(-ang_vel_error / std**2)
+
+
+def roughness_gate_from_scanner(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "height_scanner",
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    x_window: tuple[float, float] = (0.15, 0.65),
+    y_abs_limit: float = 0.20,
+    rough_threshold: float = 0.05,
+    rough_upper_threshold: float = 0.5,
+) -> torch.Tensor:
+    """Return a binary terrain-roughness gate from the forward ray grid."""
+    sensor: RayCastSensor = env.scene[sensor_name]
+    asset: Entity = env.scene[asset_cfg.name]
+    hit_pos_w = sensor.data.hit_pos_w
+    hit_rel_w = hit_pos_w - sensor.data.pos_w.unsqueeze(1)
+
+    heading = asset.data.heading_w.unsqueeze(1)
+    cos_heading = torch.cos(heading)
+    sin_heading = torch.sin(heading)
+    hit_x_b = cos_heading * hit_rel_w[..., 0] + sin_heading * hit_rel_w[..., 1]
+    hit_y_b = -sin_heading * hit_rel_w[..., 0] + cos_heading * hit_rel_w[..., 1]
+    valid = sensor.data.distances >= 0.0
+    valid &= (hit_x_b >= x_window[0]) & (hit_x_b <= x_window[1])
+    valid &= torch.abs(hit_y_b) <= y_abs_limit
+
+    z_hits = hit_pos_w[..., 2]
+    has_valid = valid.any(dim=1)
+    z_max = torch.where(valid, z_hits, torch.full_like(z_hits, -torch.inf)).amax(dim=1)
+    z_min = torch.where(valid, z_hits, torch.full_like(z_hits, torch.inf)).amin(dim=1)
+    roughness = torch.where(has_valid, z_max - z_min, torch.zeros_like(z_max))
+    return ((roughness >= rough_threshold) & (roughness < rough_upper_threshold)).float()
+
+
+def _camera_depth_lr(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "camera_terrain",
+    side_fraction: float = 0.3,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    camera = env.scene[sensor_name]
+    depth = camera.data.output["distance_to_image_plane"][..., 0]
+    width = depth.shape[2]
+    side_width = max(1, int(round(width * side_fraction)))
+    left_depth = depth[:, :, :side_width].mean(dim=(1, 2))
+    right_depth = depth[:, :, width - side_width :].mean(dim=(1, 2))
+    return left_depth, right_depth, right_depth - left_depth
+
+
+def _update_depth_target_view(
+    env: ManagerBasedRlEnv,
+    scanner_name: str = "height_scanner",
+    terrain_camera_name: str = "camera_terrain",
+    depth_diff_threshold: float = 0.01,
+    confirm_steps: int = 1,
+    rough_threshold: float = 0.05,
+    rough_upper_threshold: float = 0.5,
+) -> torch.Tensor:
+    """Select forward/left/right view from terrain depth, once per environment step.
+
+    The returned convention follows the depth image: ``-1`` is left and ``+1``
+    is right.  H2's positive yaw joint rotates left, so reward functions convert
+    this view convention to joint coordinates explicitly.
+    """
+    step = int(env.common_step_counter)
+    if getattr(env, "_h2_yaw_target_last_step", None) == step:
+        return env._h2_yaw_target_view
+
+    if not hasattr(env, "_h2_yaw_target_view"):
+        env._h2_yaw_target_view = torch.zeros(env.num_envs, dtype=torch.int64, device=env.device)
+        env._h2_yaw_pending_view = torch.zeros_like(env._h2_yaw_target_view)
+        env._h2_yaw_pending_count = torch.zeros_like(env._h2_yaw_target_view)
+        env._h2_yaw_prev_front_flat = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+        env._h2_yaw_flat_ready = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+
+    target = env._h2_yaw_target_view
+    pending = env._h2_yaw_pending_view
+    pending_count = env._h2_yaw_pending_count
+    reset_mask = env.episode_length_buf <= 1
+    target[reset_mask] = 0
+    pending[reset_mask] = 0
+    pending_count[reset_mask] = 0
+
+    gate = roughness_gate_from_scanner(
+        env,
+        sensor_name=scanner_name,
+        rough_threshold=rough_threshold,
+        rough_upper_threshold=rough_upper_threshold,
+    )
+    if reset_mask.any():
+        robot: Entity = env.scene["robot"]
+        base_height = robot.data.root_link_pos_w[:, 2]
+        # Match HMV: ground-level starts stay forward.  Side-looking is only
+        # enabled after the robot has encountered a rough section; elevated
+        # starts may use side-looking immediately.
+        reset_keep_forward = (base_height < 1.2) | (base_height > 6.0)
+        env._h2_yaw_prev_front_flat[reset_mask] = gate[reset_mask] < 0.5
+        env._h2_yaw_flat_ready[reset_mask] = ~reset_keep_forward[reset_mask]
+
+    _, _, depth_diff = _camera_depth_lr(env, terrain_camera_name)
+    candidate = torch.zeros_like(target)
+    flat = gate < 0.5
+    candidate[flat & (depth_diff > depth_diff_threshold)] = 1
+    candidate[flat & (depth_diff < -depth_diff_threshold)] = -1
+
+    rough = ~flat
+    target[rough] = 0
+    pending[rough] = 0
+    pending_count[rough] = 0
+    env._h2_yaw_flat_ready[rough] = True
+
+    active = flat & env._h2_yaw_flat_ready
+    different = active & (candidate != target)
+    undecided = different & (candidate == 0)
+    pending[undecided] = 0
+    pending_count[undecided] = 0
+
+    decisive = different & (candidate != 0)
+    same_pending = decisive & (candidate == pending)
+    pending_count[same_pending] += 1
+    new_pending = decisive & (candidate != pending)
+    pending[new_pending] = candidate[new_pending]
+    pending_count[new_pending] = 1
+
+    required = torch.full_like(pending_count, max(1, confirm_steps))
+    side_flip = different & (target != 0) & (candidate != 0)
+    required[side_flip] = torch.maximum(required[side_flip], torch.full_like(required[side_flip], 5))
+    promote = different & (pending_count >= required)
+    target[promote] = pending[promote]
+    pending_count[promote] = 0
+
+    env._h2_yaw_prev_front_flat = flat.clone()
+
+    env._h2_yaw_target_last_step = step
+    return target
+
+
+def _head_yaw(
+    env: ManagerBasedRlEnv,
+    yaw_joint_name: str = "head_yaw_joint",
+    yaw_joint_sign: float = 1.0,
+) -> torch.Tensor:
+    """Return canonical head yaw, positive to the robot's left."""
+    robot: Entity = env.scene["robot"]
+    joint_ids, _ = robot.find_joints((yaw_joint_name,), preserve_order=True)
+    return yaw_joint_sign * robot.data.joint_pos[:, joint_ids[0]]
+
+
+def _dynamic_wz_target(
+    env: ManagerBasedRlEnv,
+    command_name: str,
+    head_yaw_threshold: float = math.radians(15.0),
+    wz_scale: float = 2.0,
+    wz_max: float = 0.8,
+    yaw_joint_name: str = "head_yaw_joint",
+    yaw_joint_sign: float = 1.0,
+    **target_view_kwargs,
+) -> torch.Tensor:
+    command_wz = env.command_manager.get_command(command_name)[:, 2]
+    head_yaw = _head_yaw(env, yaw_joint_name, yaw_joint_sign)
+    target_view = _update_depth_target_view(env, **target_view_kwargs)
+    extra_target = torch.sign(head_yaw) * torch.clamp(
+        wz_scale * (torch.abs(head_yaw) - head_yaw_threshold), min=0.0, max=wz_max
+    )
+    return torch.where((target_view != 0) & (torch.abs(head_yaw) > head_yaw_threshold), extra_target, command_wz)
+
+
+def track_ang_vel_z_dynamic_exp(
+    env: ManagerBasedRlEnv,
+    command_name: str,
+    std: float,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    **target_view_kwargs,
+) -> torch.Tensor:
+    """Track command yaw, or follow the physical head-yaw direction at a side opening."""
+    asset: Entity = env.scene[asset_cfg.name]
+    target = _dynamic_wz_target(env, command_name, **target_view_kwargs)
+    error = torch.square(target - asset.data.root_link_ang_vel_b[:, 2])
+    return torch.exp(-error / std**2)
+
+
+def delta_yaw_reward(
+    env: ManagerBasedRlEnv,
+    command_name: str,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    **target_view_kwargs,
+) -> torch.Tensor:
+    asset: Entity = env.scene[asset_cfg.name]
+    target = _dynamic_wz_target(env, command_name, **target_view_kwargs)
+    delta = torch.nan_to_num(
+        torch.abs(asset.data.root_link_ang_vel_b[:, 2] - target), nan=10.0, posinf=10.0, neginf=10.0
+    )
+    over = torch.clamp(delta - 0.1, min=0.0, max=0.3)
+    penalty = 0.25 * torch.expm1(8.0 * over)
+    return torch.where(delta <= 0.1, torch.full_like(delta, 0.05), -penalty)
+
+
+def camera_yaw_target_reward(
+    env: ManagerBasedRlEnv,
+    target_yaw_abs: float = math.pi / 4.0,
+    side_yaw_start_abs: float = math.radians(15.0),
+    forward_yaw_abs_threshold: float = math.radians(10.0),
+    yaw_joint_name: str = "head_yaw_joint",
+    yaw_joint_sign: float = 1.0,
+    **target_view_kwargs,
+) -> torch.Tensor:
+    target_view = _update_depth_target_view(env, **target_view_kwargs)
+    yaw = _head_yaw(env, yaw_joint_name, yaw_joint_sign)
+    forward_reward = torch.clamp(1.0 - torch.abs(yaw) / forward_yaw_abs_threshold, min=0.0)
+    # H2 head yaw uses +Z: positive joint yaw is left, while target_view +1 is right.
+    yaw_in_target_dir = -target_view.to(yaw.dtype) * yaw
+    denom = max(target_yaw_abs - side_yaw_start_abs, 1e-6)
+    side_reward = torch.clamp((yaw_in_target_dir - side_yaw_start_abs) / denom, min=0.0, max=1.0)
+    return torch.where(target_view == 0, forward_reward, side_reward)
+
+
+def camera_yaw_side_start_penalty(
+    env: ManagerBasedRlEnv,
+    side_yaw_start_abs: float = math.radians(15.0),
+    yaw_joint_name: str = "head_yaw_joint",
+    yaw_joint_sign: float = 1.0,
+    **target_view_kwargs,
+) -> torch.Tensor:
+    target_view = _update_depth_target_view(env, **target_view_kwargs)
+    yaw = _head_yaw(env, yaw_joint_name, yaw_joint_sign)
+    yaw_in_target_dir = -target_view.to(yaw.dtype) * yaw
+    penalty = torch.clamp((side_yaw_start_abs - yaw_in_target_dir) / (2.0 * side_yaw_start_abs), min=0.0)
+    return torch.where(target_view == 0, torch.zeros_like(penalty), penalty)
+
+
+def head_body_yaw_l2(
+    env: ManagerBasedRlEnv,
+    forward_penalty_scale: float = 10.0,
+    yaw_joint_name: str = "head_yaw_joint",
+    yaw_joint_sign: float = 1.0,
+    **target_view_kwargs,
+) -> torch.Tensor:
+    target_view = _update_depth_target_view(env, **target_view_kwargs)
+    yaw = _head_yaw(env, yaw_joint_name, yaw_joint_sign)
+    scale = torch.where(target_view == 0, torch.full_like(yaw, forward_penalty_scale), torch.ones_like(yaw))
+    return torch.square(yaw) * scale
+
+
+def camera_pitch_target_reward(
+    env: ManagerBasedRlEnv,
+    target_pitch: float,
+    std: float,
+    rough: bool,
+    pitch_joint_name: str = "head_pitch_joint",
+    scanner_name: str = "height_scanner",
+    rough_threshold: float = 0.05,
+    rough_upper_threshold: float = 0.5,
+) -> torch.Tensor:
+    robot: Entity = env.scene["robot"]
+    joint_ids, _ = robot.find_joints((pitch_joint_name,), preserve_order=True)
+    pitch = robot.data.joint_pos[:, joint_ids[0]]
+    gate = roughness_gate_from_scanner(
+        env,
+        sensor_name=scanner_name,
+        rough_threshold=rough_threshold,
+        rough_upper_threshold=rough_upper_threshold,
+    )
+    score = torch.exp(-torch.square(pitch - target_pitch) / std**2)
+    return (gate if rough else 1.0 - gate) * score
+
+
+class camera_axis_action_acc_l2(ManagerTermBase):
+    """Penalize second-order action changes on one of the final two head axes."""
+
+    def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv):
+        super().__init__(env)
+        self._previous = torch.zeros(env.num_envs, device=env.device)
+        self._previous_rate = torch.zeros_like(self._previous)
+
+    def reset(self, env_ids: Sequence[int] | torch.Tensor | slice | None = None) -> None:
+        index = slice(None) if env_ids is None else env_ids
+        self._previous[index] = 0.0
+        self._previous_rate[index] = 0.0
+
+    def __call__(self, env: ManagerBasedRlEnv, axis_id: int, camera_action_dim: int = 2) -> torch.Tensor:
+        action = env.action_manager.action[:, -camera_action_dim + axis_id]
+        rate = action - self._previous
+        acceleration = rate - self._previous_rate
+        self._previous[:] = action
+        self._previous_rate[:] = rate
+        return torch.square(acceleration)
 
 
 def heading_error(env: ManagerBasedRlEnv, command_name: str) -> torch.Tensor:

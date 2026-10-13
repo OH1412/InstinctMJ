@@ -63,11 +63,8 @@ from instinct_mj.terrains.virtual_obstacle.edge_cylinder_cfg import Greedyconcat
 from instinct_mj.utils.noise import CropAndResizeCfg, DepthNormalizationCfg, GaussianBlurNoiseCfg
 
 __file_dir__ = os.path.dirname(os.path.realpath(__file__))
-# NOTE: Change this to your local parkour dataset root before training / play.
-# Keep `filtered_motion_selection_filepath` under this directory unless you point it elsewhere.
-# Example:
-# _PARKOUR_DATASET_DIR = os.path.expanduser("~/your/path/to/parkour_motion_reference")
-_PARKOUR_DATASET_DIR = os.path.expanduser("~/Xyk/Datasets/data&model/parkour_motion_reference")
+# Official Hiking in the Wild archive extracted inside this container.
+_PARKOUR_DATASET_DIR = "/home/descfly/humanoid_robot/datasets/hiking_in_the_wild/data&model/parkour_motion_reference"
 
 # ---------------------------------------------------------------------------
 # Motion reference configs
@@ -363,7 +360,7 @@ def instinct_g1_parkour_amp_env_cfg(
                 "crop_and_resize": CropAndResizeCfg(crop_region=(18, 0, 16, 16)),
                 "gaussian_blur": GaussianBlurNoiseCfg(kernel_size=3, sigma=1),
                 "depth_normalization": DepthNormalizationCfg(
-                    depth_range=(0.0, 2.5),
+                    depth_range=(0.5, 2.5),
                     normalize=True,
                     output_range=(0.0, 1.0),
                 ),

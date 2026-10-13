@@ -593,9 +593,26 @@ class AmassMotion(MotionBuffer):
         root_trans = torch.as_tensor(raw_data["base_pos_w"], device=self.buffer_device, dtype=torch.float)
         root_quat = torch.as_tensor(raw_data["base_quat_w"], device=self.buffer_device, dtype=torch.float)
 
-        # qpos_sim = qpos[retargetted_joints_to_output_joints_ids]
-        retargetted_joints_to_output_joints_ids = [joint_names.index(j_name) for j_name in self.sim_joint_names]
-        joint_pos = joint_pos[:, retargetted_joints_to_output_joints_ids]
+        # Retargeted archives may intentionally omit auxiliary joints such as
+        # a camera gimbal.  Preserve named motion channels and initialize only
+        # the missing simulation joints from the articulation's default pose.
+        source_index = {name: index for index, name in enumerate(joint_names)}
+        missing_joints = [name for name in self.sim_joint_names if name not in source_index]
+        if missing_joints:
+            default_joint_pos = self.articulation_view.data.default_joint_pos[0].to(
+                device=self.buffer_device, dtype=joint_pos.dtype
+            )
+            expanded_joint_pos = default_joint_pos.unsqueeze(0).expand(joint_pos.shape[0], -1).clone()
+            for output_index, joint_name in enumerate(self.sim_joint_names):
+                if joint_name in source_index:
+                    expanded_joint_pos[:, output_index] = joint_pos[:, source_index[joint_name]]
+            joint_pos = expanded_joint_pos
+            print(
+                "[AMASS Motion] Using articulation defaults for joints absent from "
+                f"{os.path.basename(filepath)}: {missing_joints}"
+            )
+        else:
+            joint_pos = joint_pos[:, [source_index[name] for name in self.sim_joint_names]]
 
         return self._pack_retargetted_motion_sequence(
             root_trans,

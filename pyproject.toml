@@ -80,6 +80,8 @@ instinct_mj = [
   "assets/resources/unitree_g1/urdf/*.urdf",
   "assets/resources/unitree_g1/meshes/*.STL",
   "assets/resources/unitree_g1/meshes/*.stl",
+  "assets/resources/unitree_h2/*.xml",
+  "assets/resources/unitree_h2/meshes/*.stl",
   "tasks/parkour/mjcf/*.xml",
 ]
 

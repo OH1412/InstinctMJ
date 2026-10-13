@@ -2,6 +2,38 @@
 
 ## Basic Usage Guidelines
 
+### Unitree H2 (HMV port)
+
+The H2 task includes the physical two-axis head, terrain-only gaze sensors,
+HMV gaze rewards, and the left/right stair-corridor terrains:
+
+- `Instinct-Parkour-Target-PPO-H2-v0` (train)
+- `Instinct-Parkour-Target-PPO-H2-Play-v0` (play)
+
+```bash
+instinct-train Instinct-Parkour-Target-PPO-H2-v0
+instinct-play Instinct-Parkour-Target-PPO-H2-Play-v0 --load-run <run_name>
+```
+
+The action layout is 29 body joints followed by
+`[head_yaw_joint, head_pitch_joint]`. The head limits are yaw
+`[-0.8, 0.8]` rad and pitch `[-0.25, 0.5]` rad. Policy observations keep the
+two head positions immediately before `depth_image`, so they remain part of
+the contiguous proprioceptive input used by ONNX inference.
+
+To create the JetPack 5.1.1 / ONNX Runtime 1.16.3 deployment package added in
+HMV commit `555e24d`, run:
+
+```bash
+instinct-play Instinct-Parkour-Target-PPO-H2-Play-v0 \
+  --load-run <run_name> \
+  --export-deployment-package
+```
+
+This writes legacy-opset encoder/actor ONNX files under `exported/`, clamps
+the ONNX IR version to 9, copies `env.yaml` and `agent.yaml`, and writes a
+deployment manifest.
+
 ### Parkour Task
 
 **Task IDs:**
@@ -179,3 +211,13 @@ This matters because `instinct_onboard/instinct_onboard/agents/base.py` and `ins
 - `--video`: Record training/playback videos
 - `--export-onnx`: Export the trained model to ONNX format for onboard deployment during playing
 - `--use-onnx`: Use the ONNX model for inference during playing
+# Unitree H2
+
+The H2 MuJoCo asset and plain-PPO Parkour tasks are registered as:
+
+```bash
+uv run instinct-train Instinct-Parkour-Target-PPO-H2-v0
+uv run instinct-play Instinct-Parkour-Target-PPO-H2-Play-v0 --load-run <run_name>
+```
+
+The H2 model uses the native 31-joint MuJoCo order, including the two head-gimbal joints.

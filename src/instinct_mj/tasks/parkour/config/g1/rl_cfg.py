@@ -86,7 +86,7 @@ class G1ParkourPPORunnerCfg(InstinctRlOnPolicyRunnerCfg):
     num_steps_per_env: int = 24
     policy_observation_group: str = "policy"
     critic_observation_group: str = "critic"
-    max_iterations: int = 30000
+    max_iterations: int = 300000
     save_interval: int = 5000
     experiment_name: str = "g1_parkour"
     resume: bool = False
@@ -98,3 +98,12 @@ class G1ParkourPPORunnerCfg(InstinctRlOnPolicyRunnerCfg):
 
 def g1_parkour_amp_instinct_rl_cfg() -> G1ParkourPPORunnerCfg:
     return G1ParkourPPORunnerCfg()
+
+
+def g1_d455_parkour_amp_instinct_rl_cfg() -> G1ParkourPPORunnerCfg:
+    """Fresh run namespace for the incompatible 31-DoF policy shape."""
+    cfg = G1ParkourPPORunnerCfg()
+    cfg.experiment_name = "g1_d455_parkour"
+    cfg.load_run = None
+    cfg.save_interval = 500
+    return cfg

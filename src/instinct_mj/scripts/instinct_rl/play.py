@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -47,7 +48,11 @@ class PlayConfig:
     video_height: int | None = None
     video_width: int | None = None
     export_onnx: bool = False
+    export_deployment_package: bool = False
     onnx_output_dir: str | None = None
+    encoder_opset: int = 12
+    actor_opset: int = 12
+    max_onnx_ir_version: int = 9
     use_onnx: bool = False
     onnx_model_dir: str | None = None
     no_resume: bool = False
@@ -263,7 +268,12 @@ def _resolve_onnx_output_dir(
     checkpoint: Path | None,
 ) -> Path:
     if cfg.onnx_output_dir is not None:
-        return Path(cfg.onnx_output_dir).expanduser().resolve()
+        requested = Path(cfg.onnx_output_dir).expanduser().resolve()
+        return requested / "exported" if cfg.export_deployment_package else requested
+    if cfg.export_deployment_package:
+        if checkpoint is None:
+            raise ValueError("Deployment-package export requires a checkpoint.")
+        return checkpoint.parent / f"deploy_package_{checkpoint.stem}_ir{cfg.max_onnx_ir_version}" / "exported"
     if checkpoint is not None:
         return checkpoint.parent / "exported"
     return Path("logs") / "instinct_rl" / agent_cfg.experiment_name / task_id / "exported"
@@ -320,6 +330,8 @@ def _build_parkour_onnx_policy(
         "joint_vel",
         "actions",
     ]
+    if "camera_yaw_pitch" in obs_segments:
+        proprio_components.append("camera_yaw_pitch")
     return load_parkour_onnx_model(
         model_dir=str(model_dir),
         get_subobs_func=lambda obs: get_subobs_by_components(
@@ -342,10 +354,67 @@ def _export_policy_to_onnx(
     vec_env: InstinctRlVecEnvWrapper,
     task_id: str,
     export_dir: Path,
+    legacy_jetpack_export: bool = False,
+    encoder_opset: int = 12,
+    actor_opset: int = 12,
 ) -> None:
     export_dir.mkdir(parents=True, exist_ok=True)
     observations, _ = vec_env.get_observations()
-    runner.export_as_onnx(obs=observations, export_model_dir=str(export_dir))
+    if legacy_jetpack_export:
+        from instinct_rl.modules.conv2d import Conv2dHeadModel
+        from instinct_rl.modules.transformer import TransformerHeadModel
+        from instinct_rl.utils.utils import get_subobs_by_components, module_is_from_type
+
+        actor_critic = runner.alg.actor_critic
+        actor_critic.eval()
+        encoders = actor_critic.encoders
+        exported_paths: list[Path] = []
+        with torch.no_grad():
+            for block_name, block in encoders._parallel_blocks.items():
+                block_config = encoders.block_configs[block_name]
+                component_names = block_config["component_names"]
+                if isinstance(component_names, str):
+                    component_names = [component_names]
+                block_input = get_subobs_by_components(
+                    observations,
+                    component_names,
+                    encoders.input_segments,
+                    temporal=module_is_from_type(block, TransformerHeadModel),
+                )
+                if module_is_from_type(block, Conv2dHeadModel):
+                    if len(component_names) != 1:
+                        raise ValueError(f"Conv2d encoder {block_name} expects one component, got {component_names}")
+                    block_input = block_input.reshape(-1, *encoders.input_segments[component_names[0]])
+                if module_is_from_type(block, TransformerHeadModel):
+                    torch.backends.cuda.enable_mem_efficient_sdp(False)
+                output_path = export_dir / f"{encoders._sequential_idx}-{block_name}.onnx"
+                torch.onnx.export(
+                    block,
+                    block_input,
+                    output_path,
+                    input_names=["input"],
+                    output_names=["output"],
+                    opset_version=encoder_opset,
+                    dynamo=False,
+                )
+                exported_paths.append(output_path)
+            encoded_observations = encoders(observations)
+            actor_path = export_dir / "actor.onnx"
+            torch.onnx.export(
+                actor_critic.actor,
+                encoded_observations,
+                actor_path,
+                input_names=["input"],
+                output_names=["output"],
+                opset_version=actor_opset,
+                dynamo=False,
+            )
+        required_paths = (actor_path, export_dir / "0-depth_encoder.onnx")
+        missing = [str(path) for path in required_paths if not path.exists()]
+        if missing:
+            raise FileNotFoundError(f"Missing required exported ONNX files: {missing}; exported={exported_paths}")
+    else:
+        runner.export_as_onnx(obs=observations, export_model_dir=str(export_dir))
 
     metadata = {
         "task_id": task_id,
@@ -359,6 +428,51 @@ def _export_policy_to_onnx(
         encoding="utf-8",
     )
     print(f"[INFO] Exported ONNX artifacts to: {export_dir}")
+
+
+def _finalize_deployment_package(
+    *,
+    export_dir: Path,
+    checkpoint: Path,
+    task_id: str,
+    cfg: PlayConfig,
+) -> None:
+    """Clamp ONNX IR versions and collect run parameters for JetPack deployment."""
+    import onnx
+
+    package_dir = export_dir.parent
+    ir_versions: dict[str, int] = {}
+    for model_path in sorted(export_dir.glob("*.onnx")):
+        model = onnx.load(model_path)
+        if model.ir_version > cfg.max_onnx_ir_version:
+            model.ir_version = cfg.max_onnx_ir_version
+            onnx.save(model, model_path)
+        ir_versions[str(model_path.relative_to(package_dir))] = int(onnx.load(model_path).ir_version)
+
+    params_src = checkpoint.parent / "params"
+    params_dst = package_dir / "params"
+    params_dst.mkdir(parents=True, exist_ok=True)
+    for name in ("env.yaml", "agent.yaml"):
+        src = params_src / name
+        if not src.exists():
+            raise FileNotFoundError(f"Missing required run parameter file: {src}")
+        shutil.copy2(src, params_dst / name)
+
+    manifest = {
+        "task_id": task_id,
+        "checkpoint": str(checkpoint.resolve()),
+        "target": {
+            "jetpack": "5.1.1",
+            "python": "3.8",
+            "onnxruntime": "1.16.3",
+            "arch": "aarch64",
+            "max_onnx_ir_version": cfg.max_onnx_ir_version,
+        },
+        "onnx_opsets": {"encoder": cfg.encoder_opset, "actor": cfg.actor_opset},
+        "onnx_ir_versions": ir_versions,
+    }
+    (package_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    print(f"[INFO] Deployment package written to: {package_dir}")
 
 
 def _run_headless_rollout(
@@ -415,17 +529,18 @@ def run_play(task_id: str, cfg: PlayConfig) -> None:
     if cfg.use_onnx and cfg.agent != "trained":
         raise ValueError("`--use-onnx` only supports `--agent trained`.")
 
+    wants_export = cfg.export_onnx or cfg.export_deployment_package
     if cfg.agent == "trained":
         if cfg.no_resume:
-            if cfg.export_onnx:
-                raise ValueError("`--no-resume` cannot be combined with `--export-onnx`.")
+            if wants_export:
+                raise ValueError("`--no-resume` cannot be combined with ONNX export.")
             if not cfg.use_onnx:
                 raise ValueError("`--no-resume` with `--agent trained` requires `--use-onnx True`.")
             print("[INFO] No-resume mode is enabled. Skip checkpoint loading and use ONNX policy.")
         else:
             checkpoint = _resolve_checkpoint(task_id, cfg, agent_cfg)
-    elif cfg.export_onnx:
-        raise ValueError("`--export-onnx` only supports `--agent trained`.")
+    elif wants_export:
+        raise ValueError("ONNX export only supports `--agent trained`.")
 
     env_cls = load_env_cls(task_id)
     env = env_cls(
@@ -462,7 +577,7 @@ def run_play(task_id: str, cfg: PlayConfig) -> None:
         policy = _build_dummy_policy(cfg.agent, (vec_env.num_envs, vec_env.num_actions), device)
     else:
         runner = None
-        if checkpoint is not None or cfg.export_onnx:
+        if checkpoint is not None or wants_export:
             runner_cls = load_runner_cls(task_id) or OnPolicyRunner
             agent_cfg_dict = agent_cfg.to_dict()
             runner = runner_cls(
@@ -478,7 +593,7 @@ def run_play(task_id: str, cfg: PlayConfig) -> None:
             runner.load(str(checkpoint))
             print(f"[INFO] Loaded checkpoint: {checkpoint}")
 
-        if cfg.export_onnx:
+        if wants_export:
             if checkpoint is None:
                 raise RuntimeError("checkpoint must be provided when export_onnx is enabled.")
             if runner is None:
@@ -494,7 +609,17 @@ def run_play(task_id: str, cfg: PlayConfig) -> None:
                 vec_env=vec_env,
                 task_id=task_id,
                 export_dir=onnx_output_dir,
+                legacy_jetpack_export=cfg.export_deployment_package,
+                encoder_opset=cfg.encoder_opset,
+                actor_opset=cfg.actor_opset,
             )
+            if cfg.export_deployment_package:
+                _finalize_deployment_package(
+                    export_dir=onnx_output_dir,
+                    checkpoint=checkpoint,
+                    task_id=task_id,
+                    cfg=cfg,
+                )
 
         if cfg.use_onnx:
             onnx_model_dir = _resolve_onnx_model_dir(
