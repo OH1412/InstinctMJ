@@ -81,6 +81,13 @@ class TerrainImporterCfg(TerrainImporterCfgBase):
     collision_debug_rgba: tuple[float, float, float, float] = (0.62, 0.2, 0.9, 0.35)
     """RGBA tint for terrain collision debug visualization."""
 
+    deterministic_atlas_origins: bool = False
+    """Assign environments to terrain patches in row-major order without overlap.
+
+    This is intended for visualization. Training keeps the default randomized
+    curriculum assignment across independent MuJoCo-Warp worlds.
+    """
+
     terrain_type: Literal["generator", "plane", "hacked_generator"] = "generator"
     """The type of terrain to generate. Defaults to "generator".
 

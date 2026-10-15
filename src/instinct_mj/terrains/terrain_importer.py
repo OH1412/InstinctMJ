@@ -771,4 +771,22 @@ class TerrainImporter(TerrainImporterBase):
         if origins is None and getattr(self, "_hacked_terrain_type", None) == "hacked_generator":
             # In case of None override, we don't need to do anything
             return
-        return super().configure_env_origins(origins)
+        super().configure_env_origins(origins)
+        if origins is None or not self.cfg.deterministic_atlas_origins:
+            return
+
+        assert self.terrain_origins is not None
+        num_rows, num_cols = self.terrain_origins.shape[:2]
+        num_patches = num_rows * num_cols
+        if self.cfg.num_envs > num_patches:
+            raise ValueError(
+                "deterministic_atlas_origins requires num_envs <= the number of terrain patches, "
+                f"got {self.cfg.num_envs} environments for {num_rows}x{num_cols}={num_patches} patches."
+            )
+
+        # Row-major assignment: all terrain types at the easiest level first,
+        # followed by the same columns at each successively harder level.
+        env_ids = torch.arange(self.cfg.num_envs, device=self._device, dtype=torch.long)
+        self.terrain_levels = torch.div(env_ids, num_cols, rounding_mode="floor")
+        self.terrain_types = torch.remainder(env_ids, num_cols)
+        self.env_origins = self.terrain_origins[self.terrain_levels, self.terrain_types]

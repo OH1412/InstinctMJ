@@ -154,7 +154,7 @@ class FiledTerrainGenerator(TerrainGenerator):
 
         # Access the i-th row, j-th column subterrain config by
         # self._subterrain_specific_cfgs[i*num_cols + j]
-        self._subterrain_specific_cfgs: list[SubTerrainBaseCfg] = []
+        self._subterrain_specific_cfgs: list[SubTerrainBaseCfg | None] = []
         self._terrain_meshes: list[trimesh.Trimesh] = []
         self.terrain_mesh: trimesh.Trimesh | None = None
         # Keep original patch radii (including list-style radii) for
@@ -546,12 +546,20 @@ class FiledTerrainGenerator(TerrainGenerator):
         cfg.difficulty = float(difficulty)
         cfg.seed = self.cfg.seed
         # <<< NOTE
-        self._subterrain_specific_cfgs.append(cfg)  # since in super function, cfg is a copy of the original config.
+        # Curriculum generation visits columns first, while callers address
+        # metadata by ``(terrain_level, terrain_type)``.  Store into the
+        # corresponding row-major slot instead of relying on append order.
+        terrain_linear_idx = sub_row * self._num_cols + sub_col
+        if len(self._subterrain_specific_cfgs) <= terrain_linear_idx:
+            self._subterrain_specific_cfgs.extend(
+                [None] * (terrain_linear_idx + 1 - len(self._subterrain_specific_cfgs))
+            )
+        self._subterrain_specific_cfgs[terrain_linear_idx] = cfg
 
         return spawn_origin
 
     @property
-    def subterrain_specific_cfgs(self) -> list[SubTerrainBaseCfg]:
+    def subterrain_specific_cfgs(self) -> list[SubTerrainBaseCfg | None]:
         """Get the specific configurations for all subterrains."""
         return self._subterrain_specific_cfgs.copy()  # Return a copy to avoid external modification.
 
@@ -559,7 +567,7 @@ class FiledTerrainGenerator(TerrainGenerator):
         self, row_ids: int | torch.Tensor, col_ids: int | torch.Tensor
     ) -> list[SubTerrainBaseCfg] | SubTerrainBaseCfg | None:
         """Get the specific configuration for a subterrain by its row and column index."""
-        num_cols = self.cfg.num_cols
+        num_cols = self._num_cols
         idx = row_ids * num_cols + col_ids
         if isinstance(idx, torch.Tensor):
             idx = idx.cpu().numpy().tolist()  # Convert to list if it's a tensor.

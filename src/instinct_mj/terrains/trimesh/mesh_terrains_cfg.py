@@ -34,12 +34,24 @@ class MeshCorridorTerrainCfg(SubTerrainBaseCfg):
     u_turn_platform_length: float = 1.3
     segment_count: int = 2
     rise_per_stair: float = 2.0
+    num_steps: int | None = None
+    """Fixed number of steps per flight. When set, the total rise follows the step height."""
     step_height_range: tuple[float, float] = (0.15, 0.20)
     step_tread_range: tuple[float, float] = (0.17, 0.25)
     component_types: list[str] = field(default_factory=lambda: ["u_turn"])
     first_u_turn_side: float | None = None
     straight_skip_mid_platform: bool = False
     enable_mid_platform_spawn: bool = True
+    initial_spawn_backoff: float = 0.0
+    """Distance behind the first stair used for the default terrain origin."""
+    spawn_points_local: list[list[float]] = field(default_factory=list)
+    """Safe platform spawn points relative to the generated terrain origin."""
+    spawn_yaws: list[float] = field(default_factory=list)
+    """World-local heading associated with each safe platform spawn point."""
+    spawn_yaw: float = 0.0
+    """Fallback heading when per-point headings are unavailable."""
+    ordered_waypoints_local: list[list[float]] = field(default_factory=list)
+    """Ordered navigation targets relative to the generated terrain origin."""
 
     def function(self, difficulty: float, spec: mujoco.MjSpec, rng: np.random.Generator):
         return mesh_terrains.corridor_terrain(self, difficulty, spec, rng)

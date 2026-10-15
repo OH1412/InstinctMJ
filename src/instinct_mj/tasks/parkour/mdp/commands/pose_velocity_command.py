@@ -83,13 +83,22 @@ class PoseVelocityCommand(CommandTerm):
             proportions = np.array([sub_cfg.proportion for sub_cfg in terrain_generator_cfg.sub_terrains.values()])
             proportions /= np.sum(proportions)
 
-            # find the sub-terrain index for each column
-            # we generate the terrains based on their proportion (not randomly sampled)
-            sub_indices = []
-            for index in range(terrain_generator_cfg.num_cols):
-                sub_index = np.min(np.where(index / terrain_generator_cfg.num_cols + 0.001 < np.cumsum(proportions))[0])
-                sub_indices.append(sub_index)
-            sub_indices = np.array(sub_indices, dtype=np.int32)
+            # Find the sub-terrain index represented by each generated column.
+            # Curriculum terrain generation assigns exactly one column to each
+            # sub-terrain in insertion order; proportions affect spawning only.
+            # Random/non-curriculum generation retains the proportional mapping.
+            if terrain_generator_cfg.curriculum:
+                sub_indices = np.arange(len(terrain_generator_cfg.sub_terrains), dtype=np.int32)
+            else:
+                sub_indices = []
+                for index in range(terrain_generator_cfg.num_cols):
+                    sub_index = np.min(
+                        np.where(
+                            index / terrain_generator_cfg.num_cols + 0.001 < np.cumsum(proportions)
+                        )[0]
+                    )
+                    sub_indices.append(sub_index)
+                sub_indices = np.array(sub_indices, dtype=np.int32)
             sub_terrains_names = list(terrain_generator_cfg.sub_terrains.keys())
             for key, value in self.cfg.velocity_ranges.items():
                 if key in sub_terrains_names:
@@ -129,6 +138,32 @@ class PoseVelocityCommand(CommandTerm):
             )
         # valid targets: (terrain_level, terrain_type, num_patches, 3)
         self.valid_targets: torch.Tensor = self.terrain.flat_patches["target"]
+
+        # Some structured terrains expose an ordered route instead of an
+        # interchangeable pool of target patches.  Store one padded waypoint
+        # row per environment so advancement remains fully batched at runtime.
+        self.ordered_waypoint_index = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self.ordered_waypoint_count = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        ordered_waypoints: list[list[list[float]]] = [[] for _ in range(self.num_envs)]
+        generator = getattr(self.terrain, "terrain_generator", None)
+        get_subterrain_cfg = getattr(generator, "get_subterrain_cfg", None)
+        if get_subterrain_cfg is not None:
+            subterrain_cfgs = get_subterrain_cfg(self.terrain.terrain_levels, self.terrain.terrain_types)
+            for env_id, subterrain_cfg in enumerate(subterrain_cfgs):
+                points = getattr(subterrain_cfg, "ordered_waypoints_local", None)
+                if points:
+                    ordered_waypoints[env_id] = points
+                    self.ordered_waypoint_count[env_id] = len(points)
+
+        max_waypoints = max((len(points) for points in ordered_waypoints), default=0)
+        self.ordered_waypoints_w = torch.zeros(
+            (self.num_envs, max_waypoints, 3), dtype=self.pos_command_w.dtype, device=self.device
+        )
+        for env_id, points in enumerate(ordered_waypoints):
+            if not points:
+                continue
+            local_points = torch.tensor(points, dtype=self.pos_command_w.dtype, device=self.device)
+            self.ordered_waypoints_w[env_id, : len(points)] = local_points + self.terrain.env_origins[env_id]
 
     def __str__(self) -> str:
         msg = "PositionCommand:\n"
@@ -195,6 +230,36 @@ class PoseVelocityCommand(CommandTerm):
             self.terrain.terrain_levels[env_ids], self.terrain.terrain_types[env_ids], ids
         ]
 
+        # Initialize an ordered route only on episode reset (the command
+        # counter is incremented after this method).  Timed command resampling
+        # may change speed limits, but must not jump to another platform.
+        ordered_env_ids = env_ids[self.ordered_waypoint_count[env_ids] > 0]
+        if len(ordered_env_ids) > 0:
+            reset_env_ids = ordered_env_ids[self.command_counter[ordered_env_ids] == 0]
+            if len(reset_env_ids) > 0:
+                waypoint_xy = self.ordered_waypoints_w[reset_env_ids, :, :2]
+                root_xy = self.robot.data.root_link_pos_w[reset_env_ids, None, :2]
+                distances = torch.linalg.vector_norm(waypoint_xy - root_xy, dim=-1)
+                valid = torch.arange(max(1, self.ordered_waypoints_w.shape[1]), device=self.device)[None, :] < (
+                    self.ordered_waypoint_count[reset_env_ids, None]
+                )
+                distances = torch.where(valid, distances, torch.full_like(distances, torch.inf))
+                nearest_distance, nearest_index = distances.min(dim=1)
+                # Default ground spawns start at waypoint zero.  A reset that
+                # lands directly on a safe platform continues with the next
+                # waypoint, except that the final platform remains terminal.
+                starts_on_waypoint = nearest_distance <= self.cfg.target_dis_threshold
+                next_index = torch.minimum(
+                    nearest_index + 1,
+                    self.ordered_waypoint_count[reset_env_ids] - 1,
+                )
+                self.ordered_waypoint_index[reset_env_ids] = torch.where(
+                    starts_on_waypoint, next_index, torch.zeros_like(next_index)
+                )
+
+            waypoint_index = self.ordered_waypoint_index[ordered_env_ids]
+            self.pos_command_w[ordered_env_ids] = self.ordered_waypoints_w[ordered_env_ids, waypoint_index]
+
         # sample velocity commands
         r = torch.empty(len(env_ids), device=self.device)
         # -- linear velocity - x direction
@@ -211,6 +276,7 @@ class PoseVelocityCommand(CommandTerm):
         )
         # update standing envs
         self.is_standing_env[env_ids] = r.uniform_(0.0, 1.0) <= self.cfg.rel_standing_envs
+        self.is_standing_env[ordered_env_ids] = False
 
         # Only update random velocities for envs that are currently being resampled AND are marked for random velocity
         # Create a mask for the current batch of env_ids
@@ -246,6 +312,20 @@ class PoseVelocityCommand(CommandTerm):
         """Re-target the position command to the current root state."""
         # Pure function of the current state; refreshing all envs is safe.
         del env_ids
+        ordered_env_ids = (self.ordered_waypoint_count > 0).nonzero(as_tuple=False).flatten()
+        if len(ordered_env_ids) > 0:
+            target_xy = self.pos_command_w[ordered_env_ids, :2]
+            root_xy = self.robot.data.root_link_pos_w[ordered_env_ids, :2]
+            reached = torch.linalg.vector_norm(target_xy - root_xy, dim=-1) <= self.cfg.target_dis_threshold
+            can_advance = self.ordered_waypoint_index[ordered_env_ids] + 1 < self.ordered_waypoint_count[
+                ordered_env_ids
+            ]
+            advance_env_ids = ordered_env_ids[reached & can_advance]
+            if len(advance_env_ids) > 0:
+                self.ordered_waypoint_index[advance_env_ids] += 1
+                waypoint_index = self.ordered_waypoint_index[advance_env_ids]
+                self.pos_command_w[advance_env_ids] = self.ordered_waypoints_w[advance_env_ids, waypoint_index]
+
         target_vec = self.pos_command_w - self.robot.data.root_link_pos_w[:, :3]
         target_dist = torch.norm(target_vec[:, :2], dim=1)
         self.pos_command_b[:] = quat_rotate_inverse(yaw_quat(self.robot.data.root_link_quat_w), target_vec)

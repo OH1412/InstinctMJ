@@ -7,7 +7,7 @@ import math
 
 from mjlab.envs.mdp.actions import JointPositionActionCfg
 from mjlab.managers import ObservationTermCfg, RewardTermCfg, SceneEntityCfg
-from mjlab.sensor import GridPatternCfg, ObjRef
+from mjlab.sensor import CameraSensorCfg, ContactMatch, ContactSensorCfg, GridPatternCfg, ObjRef
 
 import instinct_mj.envs.mdp as envs_mdp
 import instinct_mj.tasks.parkour.mdp as parkour_mdp
@@ -49,10 +49,12 @@ def _corridor(side: float) -> MeshCorridorTerrainCfg:
         u_turn_platform_length=1.3,
         segment_count=2,
         rise_per_stair=2.0,
-        step_height_range=(0.15, 0.20),
+        num_steps=10,
+        step_height_range=(0.05, 0.20),
         step_tread_range=(0.17, 0.25),
         component_types=["u_turn"],
         first_u_turn_side=side,
+        initial_spawn_backoff=1.3,
         flat_patch_sampling={
             "target": FlatPatchSamplingCfg(
                 num_patches=50,
@@ -148,34 +150,96 @@ def instinct_g1_d455_parkour_amp_cfg(*, play: bool = False):
     terrain_camera.mesh_prim_paths = ["/World/ground/"]
     terrain_camera.noise_pipeline = {}
     terrain_camera.data_histories = {}
-    cfg.scene.sensors = tuple(cfg.scene.sensors) + (height_scanner, terrain_camera)
+    arm_contact_sensor = ContactSensorCfg(
+        name="arm_contact_forces",
+        primary=ContactMatch(
+            mode="body",
+            pattern=".*(shoulder|elbow|wrist|rubber_hand).*",
+            entity="robot",
+        ),
+        fields=("force",),
+        reduce="netforce",
+        track_air_time=False,
+        history_length=3,
+    )
+    extra_sensors = [height_scanner, terrain_camera, arm_contact_sensor]
+    if play:
+        # Add a render-only MuJoCo camera so mjlab's Viser camera panel can
+        # provide its native depth preview and Frustum checkbox.  Training and
+        # policy observations continue to use the grouped ray-cast camera.
+        camera.debug_vis = False
+        terrain_camera.debug_vis = False
+        extra_sensors.append(
+            CameraSensorCfg(
+                name="d455_visualization",
+                parent_body="robot/d455_link",
+                # Move the render-only camera 4 cm along the calibrated
+                # optical axis so the D455 housing does not occlude its image.
+                # The policy ray camera remains at the original sensor origin.
+                pos=(0.02972579, 0.0, -0.02676522),
+                # MuJoCo cameras look along local -Z with +Y up.  This pose
+                # matches the ray camera's +X-forward frame after its 42 deg
+                # optical-axis correction.
+                quat=(0.64597419, 0.28760624, -0.28760624, -0.64597419),
+                fovy=G1_31DOF_D455_DEPTH_FOV[1],
+                width=55,
+                height=32,
+                data_types=("depth",),
+                use_textures=False,
+                use_shadows=False,
+                enabled_geom_groups=(0, 1, 2, 3),
+                viewer_frustum_scale=G1_31DOF_D455_DEPTH_NORMALIZATION_RANGE[1],
+                viewer_frustum_show_all=True,
+            )
+        )
+    cfg.scene.sensors = tuple(cfg.scene.sensors) + tuple(extra_sensors)
 
-    target_view = {
-        "scanner_name": "height_scanner",
-        "terrain_camera_name": "camera_terrain",
-        "depth_diff_threshold": 0.01,
-        "confirm_steps": 1,
-        "rough_threshold": 0.05,
-        "rough_upper_threshold": 0.5,
-    }
     yaw = {"yaw_joint_name": "head_yaw_joint", "yaw_joint_sign": -1.0}
-    dynamic_yaw = {
+    live_target_yaw = {
         "command_name": "base_velocity",
-        "head_yaw_threshold": math.radians(15.0),
-        "wz_scale": 2.0,
-        "wz_max": 0.8,
+        "max_head_yaw": G1_31DOF_D455_CAMERA_YAW_RANGE[1],
         **yaw,
-        **target_view,
     }
     rewards = cfg.rewards["rewards"]
+    # Do not reward merely remaining alive.  Locomotion and task progress
+    # should account for the positive return instead.
+    rewards.pop("is_alive", None)
+    # Penalize every contacting robot link except the two sole links.  The
+    # contact sensor already excludes left/right ankle_roll_link, whose
+    # collision capsules form the foot soles; keep a small 1 N noise floor.
+    rewards["undesired_contacts"].weight = -5.0
+    # Arm contacts are already included above; apply an additional -5 so a
+    # shoulder/elbow/wrist/hand contact has a combined coefficient of -10.
+    rewards["arm_contacts"] = RewardTermCfg(
+        func=parkour_mdp.undesired_contacts,
+        weight=-5.0,
+        params={"sensor_name": "arm_contact_forces", "threshold": 1.0},
+    )
+    rewards["dont_wait"].weight = -1.0
+    rewards["delayed_stuck"] = RewardTermCfg(
+        func=parkour_mdp.delayed_stuck_penalty,
+        weight=-1.0,
+        params={
+            "command_name": "base_velocity",
+            "window_s": 1.0,
+            "min_progress": 0.04,
+            "command_threshold": 0.2,
+        },
+    )
+    # Match HMV: body yaw is guided by angular-velocity tracking rather than
+    # an additional absolute heading-error penalty.  This lets the camera look
+    # toward the next waypoint without over-constraining the torso heading.
+    rewards.pop("heading_error", None)
     rewards["dof_vel_limits"].params["velocity_limits"] = copy.deepcopy(G1_29DOF_JOINT_VELOCITY_LIMITS)
     rewards["track_ang_vel_z_exp"] = RewardTermCfg(
-        func=parkour_mdp.track_ang_vel_z_dynamic_exp,
+        func=parkour_mdp.track_ang_vel_z_exp,
         weight=1.0,
-        params={"std": 0.5, **dynamic_yaw},
+        params={"command_name": "base_velocity", "std": 0.5},
     )
     rewards["delta_yaw_reward"] = RewardTermCfg(
-        func=parkour_mdp.delta_yaw_reward, weight=0.25, params=copy.deepcopy(dynamic_yaw)
+        func=parkour_mdp.delta_yaw_command_reward,
+        weight=0.25,
+        params={"command_name": "base_velocity"},
     )
     rewards["camera_yaw_action_acc_l2"] = RewardTermCfg(
         func=parkour_mdp.camera_axis_action_acc_l2,
@@ -187,27 +251,27 @@ def instinct_g1_d455_parkour_amp_cfg(*, play: bool = False):
         weight=-0.025,
         params={"axis_id": 1, "camera_action_dim": 2},
     )
-    rewards["camera_yaw_target"] = RewardTermCfg(
-        func=parkour_mdp.camera_yaw_target_reward,
-        weight=1.0,
+    # No directional camera-yaw objective: the head may choose its yaw freely.
+    rewards.pop("camera_yaw_target", None)
+    rewards.pop("camera_yaw_target_error_l2", None)
+    # Corridor waypoints encode the next platform height.  This term is gated
+    # to ordered-waypoint (corridor) environments and outweighs the planar
+    # velocity-tracking reward (3.0 versus 2.0).
+    rewards["corridor_target_height"] = RewardTermCfg(
+        func=parkour_mdp.corridor_target_height_exp,
+        weight=3.0,
         params={
-            "target_yaw_abs": math.radians(45.0),
-            "side_yaw_start_abs": math.radians(15.0),
-            "forward_yaw_abs_threshold": math.radians(10.0),
-            **yaw,
-            **target_view,
+            "command_name": "base_velocity",
+            "std": 1.0,
+            "foot_height_offset": 0.035,
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                body_names=("left_ankle_roll_link", "right_ankle_roll_link"),
+            ),
         },
     )
-    rewards["camera_yaw_side_start_penalty"] = RewardTermCfg(
-        func=parkour_mdp.camera_yaw_side_start_penalty,
-        weight=-10.0,
-        params={"side_yaw_start_abs": math.radians(15.0), **yaw, **target_view},
-    )
-    rewards["head_body_yaw_l2"] = RewardTermCfg(
-        func=parkour_mdp.head_body_yaw_l2,
-        weight=-0.1,
-        params={"forward_penalty_scale": 10.0, **yaw, **target_view},
-    )
+    rewards.pop("camera_yaw_side_start_penalty", None)
+    rewards.pop("head_body_yaw_l2", None)
     rewards["flat_forward_camera_pitch"] = RewardTermCfg(
         func=parkour_mdp.camera_pitch_target_reward,
         weight=1.0,
@@ -262,8 +326,65 @@ def instinct_g1_d455_parkour_amp_legacy_terrain_cfg(*, play: bool = False):
     cfg.scene.terrain = copy.deepcopy(legacy_cfg.scene.terrain)
     cfg.commands["base_velocity"] = copy.deepcopy(legacy_cfg.commands["base_velocity"])
     if play:
-        # Keep the training profile identical to the 80k run, but avoid
-        # generating its full 4x10 evaluation atlas before a small GUI preview.
-        cfg.scene.terrain.terrain_generator.num_rows = 1
-        cfg.scene.terrain.terrain_generator.num_cols = 4
+        # Show the full four-level curriculum atlas during native playback.
+        # Curriculum mode generates one column per terrain type, so keeping
+        # both dimensions explicit exposes every terrain at every difficulty.
+        cfg.scene.terrain.terrain_generator.num_rows = 4
+        cfg.scene.terrain.terrain_generator.num_cols = len(
+            cfg.scene.terrain.terrain_generator.sub_terrains
+        )
+        cfg.scene.terrain.deterministic_atlas_origins = True
+        # Keep every playback robot on its assigned atlas patch after reset.
+        cfg.curriculum = {}
+    return cfg
+
+
+def instinct_g1_d455_parkour_amp_legacy_hmv_terrain_cfg(*, play: bool = False):
+    """Train on pyramid stairs (40%) and HMV U-turn corridors (60%)."""
+    cfg = instinct_g1_d455_parkour_amp_legacy_terrain_cfg(play=play)
+    terrain_gen = cfg.scene.terrain.terrain_generator
+
+    # Split each terrain family equally between its two directions:
+    # 20% ascending pyramid + 20% descending pyramid, and
+    # 30% left corridor + 30% right corridor.
+    pyramid_stairs = copy.deepcopy(terrain_gen.sub_terrains["pyramid_stairs"])
+    pyramid_stairs.proportion = 0.2
+    pyramid_stairs_inv = copy.deepcopy(terrain_gen.sub_terrains["pyramid_stairs_inv"])
+    pyramid_stairs_inv.proportion = 0.2
+    terrain_gen.sub_terrains = {
+        "pyramid_stairs": pyramid_stairs,
+        "pyramid_stairs_inv": pyramid_stairs_inv,
+    }
+    terrain_gen.sub_terrains["corridor_left"] = _corridor(1.0)
+    terrain_gen.sub_terrains["corridor_left"].proportion = 0.3
+    terrain_gen.sub_terrains["corridor_right"] = _corridor(-1.0)
+    terrain_gen.sub_terrains["corridor_right"].proportion = 0.3
+
+    # Curriculum generation uses one column per terrain in insertion order.
+    # Keeping the configured count aligned also makes command assignment and
+    # diagnostics reflect the generated four-column atlas.
+    terrain_gen.num_cols = len(terrain_gen.sub_terrains)
+
+    command_cfg = cfg.commands["base_velocity"]
+    command_cfg.velocity_ranges = {
+        name: copy.deepcopy(command_cfg.velocity_ranges[name])
+        for name in ("pyramid_stairs", "pyramid_stairs_inv")
+    }
+    command_cfg.random_velocity_terrain = []
+    corridor_velocity_range = {
+        "lin_vel_x": (0.45, 0.8),
+        "lin_vel_y": (0.0, 0.0),
+        "ang_vel_z": (-1.0, 1.0),
+    }
+    command_cfg.velocity_ranges["corridor_left"] = copy.deepcopy(corridor_velocity_range)
+    command_cfg.velocity_ranges["corridor_right"] = copy.deepcopy(corridor_velocity_range)
+    reset_base = cfg.events["reset_base"]
+    reset_base.func = parkour_mdp.reset_root_state_uniform_with_terrain_spawn
+    reset_base.params.update(
+        {
+            "corridor_spawn_ratio": 0.5,
+            "spawn_yaw_offset": 0.0,
+            "validate_spawn_metadata": True,
+        }
+    )
     return cfg

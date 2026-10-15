@@ -194,6 +194,81 @@ def _head_yaw(
     return yaw_joint_sign * robot.data.joint_pos[:, joint_ids[0]]
 
 
+def _navigation_target_head_yaw(
+    env: ManagerBasedRlEnv,
+    command_name: str,
+    max_head_yaw: float = math.radians(50.0),
+) -> torch.Tensor:
+    """Return the live target bearing in the body frame, clipped to head limits.
+
+    The pose command owns a world-frame navigation target.  Recomputing its
+    bearing every step makes the desired relative head angle naturally shrink
+    to zero as the body turns toward that target.
+    """
+    command_term = env.command_manager.get_term(command_name)
+    robot: Entity = env.scene["robot"]
+    target_vec_w = command_term.pos_command_w - robot.data.root_link_pos_w
+    target_heading_w = torch.atan2(target_vec_w[:, 1], target_vec_w[:, 0])
+    target_yaw_b = torch.atan2(
+        torch.sin(target_heading_w - robot.data.heading_w),
+        torch.cos(target_heading_w - robot.data.heading_w),
+    )
+    target_yaw_b = torch.clamp(target_yaw_b, min=-max_head_yaw, max=max_head_yaw)
+
+    # Random-velocity and standing terrains do not have a meaningful active
+    # position target, so their camera target is straight ahead.
+    target_dist = torch.linalg.vector_norm(target_vec_w[:, :2], dim=1)
+    valid_target = target_dist > command_term.cfg.target_dis_threshold
+    valid_target &= ~command_term.random_velocity_indices
+    valid_target &= ~command_term.is_standing_env
+    return torch.where(valid_target, target_yaw_b, torch.zeros_like(target_yaw_b))
+
+
+def camera_yaw_position_target_reward(
+    env: ManagerBasedRlEnv,
+    command_name: str,
+    std: float = math.radians(12.0),
+    max_head_yaw: float = math.radians(50.0),
+    yaw_joint_name: str = "head_yaw_joint",
+    yaw_joint_sign: float = 1.0,
+) -> torch.Tensor:
+    """Reward the camera for facing the live navigation target."""
+    desired_yaw = _navigation_target_head_yaw(env, command_name, max_head_yaw)
+    camera_yaw = _head_yaw(env, yaw_joint_name, yaw_joint_sign)
+    error = torch.atan2(torch.sin(camera_yaw - desired_yaw), torch.cos(camera_yaw - desired_yaw))
+    return torch.exp(-torch.square(error) / std**2)
+
+
+def camera_yaw_position_target_error_l2(
+    env: ManagerBasedRlEnv,
+    command_name: str,
+    max_head_yaw: float = math.radians(50.0),
+    yaw_joint_name: str = "head_yaw_joint",
+    yaw_joint_sign: float = 1.0,
+) -> torch.Tensor:
+    """Squared camera-to-live-target bearing error."""
+    desired_yaw = _navigation_target_head_yaw(env, command_name, max_head_yaw)
+    camera_yaw = _head_yaw(env, yaw_joint_name, yaw_joint_sign)
+    error = torch.atan2(torch.sin(camera_yaw - desired_yaw), torch.cos(camera_yaw - desired_yaw))
+    return torch.square(error)
+
+
+def delta_yaw_command_reward(
+    env: ManagerBasedRlEnv,
+    command_name: str,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """HMV-shaped yaw-rate reward against the live navigation command."""
+    asset: Entity = env.scene[asset_cfg.name]
+    target = env.command_manager.get_command(command_name)[:, 2]
+    delta = torch.nan_to_num(
+        torch.abs(asset.data.root_link_ang_vel_b[:, 2] - target), nan=10.0, posinf=10.0, neginf=10.0
+    )
+    over = torch.clamp(delta - 0.1, min=0.0, max=0.3)
+    penalty = 0.25 * torch.expm1(8.0 * over)
+    return torch.where(delta <= 0.1, torch.full_like(delta, 0.05), -penalty)
+
+
 def _dynamic_wz_target(
     env: ManagerBasedRlEnv,
     command_name: str,
@@ -353,6 +428,98 @@ def dont_wait(
     return (lin_vel_cmd_x > 0.3) * (
         (lin_vel_x < 0.15).float() + (lin_vel_x < 0.0).float() + (lin_vel_x < -0.15).float()
     )
+
+
+class delayed_stuck_penalty(ManagerTermBase):
+    """Penalize sustained failure to approach the active navigation waypoint.
+
+    Progress is measured in world-frame XY over a fixed window.  The delayed
+    decision avoids treating a brief pause for turning or stepping as a stuck
+    state.  A waypoint change starts a fresh window so ordered corridor goals
+    are evaluated independently.
+    """
+
+    def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv):
+        super().__init__(env)
+        self._reference_distance = torch.zeros(env.num_envs, device=env.device)
+        self._reference_target = torch.zeros(env.num_envs, 3, device=env.device)
+        self._elapsed_steps = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+        self._is_stuck = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+        self._initialized = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+
+    def reset(self, env_ids: Sequence[int] | torch.Tensor | slice | None = None) -> None:
+        index = slice(None) if env_ids is None else env_ids
+        self._reference_distance[index] = 0.0
+        self._reference_target[index] = 0.0
+        self._elapsed_steps[index] = 0
+        self._is_stuck[index] = False
+        self._initialized[index] = False
+
+    def __call__(
+        self,
+        env: ManagerBasedRlEnv,
+        command_name: str,
+        window_s: float = 1.0,
+        min_progress: float = 0.04,
+        command_threshold: float = 0.2,
+    ) -> torch.Tensor:
+        command_term = env.command_manager.get_term(command_name)
+        robot: Entity = env.scene["robot"]
+        target = command_term.pos_command_w
+        distance = torch.linalg.vector_norm(target[:, :2] - robot.data.root_link_pos_w[:, :2], dim=1)
+
+        active = distance > command_term.cfg.target_dis_threshold
+        active &= torch.linalg.vector_norm(command_term.vel_command_b[:, :2], dim=1) > command_threshold
+        active &= ~command_term.random_velocity_indices
+        active &= ~command_term.is_standing_env
+
+        target_changed = torch.linalg.vector_norm(target - self._reference_target, dim=1) > 1.0e-4
+        restart = ~self._initialized | target_changed | ~active | (env.episode_length_buf <= 1)
+        if torch.any(restart):
+            self._reference_distance[restart] = distance[restart]
+            self._reference_target[restart] = target[restart]
+            self._elapsed_steps[restart] = 0
+            self._is_stuck[restart] = False
+            self._initialized[restart] = True
+
+        tracking = active & ~restart
+        self._elapsed_steps[tracking] += 1
+        window_steps = max(1, int(round(window_s / env.step_dt)))
+        evaluate = tracking & (self._elapsed_steps >= window_steps)
+        if torch.any(evaluate):
+            progress = self._reference_distance[evaluate] - distance[evaluate]
+            self._is_stuck[evaluate] = progress < min_progress
+            self._reference_distance[evaluate] = distance[evaluate]
+            self._reference_target[evaluate] = target[evaluate]
+            self._elapsed_steps[evaluate] = 0
+
+        return (active & self._is_stuck).float()
+
+
+def corridor_target_height_exp(
+    env: ManagerBasedRlEnv,
+    command_name: str,
+    std: float,
+    foot_height_offset: float = 0.035,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg(
+        "robot", body_names=("left_ankle_roll_link", "right_ankle_roll_link")
+    ),
+) -> torch.Tensor:
+    """Reward the feet for approaching the active corridor waypoint height.
+
+    Ordered waypoints are only present on corridor terrains.  The ankle-link
+    origins sit above the soles, so ``foot_height_offset`` converts their mean
+    height to an approximate sole-plane height before comparing it with the
+    platform target Z.
+    """
+    command_term = env.command_manager.get_term(command_name)
+    robot: Entity = env.scene[asset_cfg.name]
+    mean_sole_height = (
+        torch.mean(robot.data.body_link_pos_w[:, asset_cfg.body_ids, 2], dim=1) - foot_height_offset
+    )
+    height_error = torch.abs(mean_sole_height - command_term.pos_command_w[:, 2])
+    corridor_mask = command_term.ordered_waypoint_count > 0
+    return corridor_mask.float() * torch.exp(-height_error / std)
 
 
 def stand_still(

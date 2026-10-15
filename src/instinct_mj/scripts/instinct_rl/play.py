@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Literal
 
 import mjlab
+import mujoco
 import torch
 import tyro
 from instinct_rl.runners import OnPolicyRunner
@@ -57,14 +58,25 @@ class PlayConfig:
     onnx_model_dir: str | None = None
     no_resume: bool = False
     no_terminations: bool = False
+    debug_termination_envs: str | None = None
+    """Comma-separated environment indices whose reset reasons are printed."""
 
 
 class _ViewerEnvAdapter:
     """Adapter so mjlab viewers can consume instinct_rl vec envs."""
 
-    def __init__(self, vec_env: InstinctRlVecEnvWrapper):
+    def __init__(self, vec_env: InstinctRlVecEnvWrapper, debug_termination_envs: str | None = None):
         self._vec_env = vec_env
         self.num_envs = vec_env.num_envs
+        self._step_count = 0
+        self._debug_termination_envs = []
+        self._debug_contact_data = None
+        if debug_termination_envs:
+            self._debug_termination_envs = [int(value.strip()) for value in debug_termination_envs.split(",")]
+            invalid = [env_id for env_id in self._debug_termination_envs if not 0 <= env_id < self.num_envs]
+            if invalid:
+                raise ValueError(f"Termination debug environment indices out of range: {invalid}")
+            self._debug_contact_data = mujoco.MjData(self.unwrapped.sim.mj_model)
 
     @property
     def device(self):
@@ -83,7 +95,46 @@ class _ViewerEnvAdapter:
         return obs
 
     def step(self, actions):
-        return self._vec_env.step(actions)
+        result = self._vec_env.step(actions)
+        self._step_count += 1
+        if self._debug_termination_envs:
+            env = self.unwrapped
+            for env_id in self._debug_termination_envs:
+                if not bool(env.reset_buf[env_id].item()):
+                    continue
+                reasons = [
+                    name
+                    for name in env.termination_manager.active_terms
+                    if bool(env.termination_manager.get_term(name)[env_id].item())
+                ]
+                contacts = self._debug_contacts(env_id) if "base_contact" in reasons else []
+                print(
+                    f"[TERMINATION DEBUG] step={self._step_count} env={env_id} "
+                    f"reasons={reasons} contacts={contacts}",
+                    flush=True,
+                )
+        return result
+
+    def _debug_contacts(self, env_id: int) -> list[str]:
+        if self._debug_contact_data is None:
+            return []
+        env = self.unwrapped
+        model = env.sim.mj_model
+        data = self._debug_contact_data
+        sim_data = env.sim.data
+        data.qpos[:] = sim_data.qpos[env_id].detach().cpu().numpy()
+        data.qvel[:] = sim_data.qvel[env_id].detach().cpu().numpy()
+        mujoco.mj_forward(model, data)
+        pairs = []
+        for contact in data.contact:
+            geom1 = int(contact.geom1)
+            geom2 = int(contact.geom2)
+            body1 = int(model.geom_bodyid[geom1])
+            body2 = int(model.geom_bodyid[geom2])
+            body1_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, body1) or f"body#{body1}"
+            body2_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, body2) or f"body#{body2}"
+            pairs.append(f"{body1_name}<->{body2_name}@{float(contact.dist):.4f}")
+        return sorted(set(pairs))
 
     def reset(self):
         return self._vec_env.reset()
@@ -571,7 +622,7 @@ def run_play(task_id: str, cfg: PlayConfig) -> None:
         critic_group=agent_cfg.critic_observation_group,
     )
 
-    viewer_env = _ViewerEnvAdapter(vec_env)
+    viewer_env = _ViewerEnvAdapter(vec_env, debug_termination_envs=cfg.debug_termination_envs)
 
     if cfg.agent in {"zero", "random"}:
         policy = _build_dummy_policy(cfg.agent, (vec_env.num_envs, vec_env.num_actions), device)

@@ -1876,6 +1876,7 @@ def corridor_terrain(
     geometries: list[TerrainGeometry] = []
     surface_meshes: list[trimesh.Trimesh] = []
     platform_centers: list[np.ndarray] = []
+    platform_spawn_transforms: list[tuple[np.ndarray, bool]] = []
 
     def add_box(extents, transform) -> None:
         extents_arr = np.asarray(extents, dtype=np.float64)
@@ -1899,11 +1900,17 @@ def corridor_terrain(
     )
 
     target_step_height = float(np.interp(difficulty, (0.0, 1.0), cfg.step_height_range))
-    num_steps = max(1, int(round(cfg.rise_per_stair / target_step_height)))
-    step_height = cfg.rise_per_stair / num_steps
-    while step_height > cfg.step_height_range[1]:
-        num_steps += 1
+    if cfg.num_steps is not None:
+        if cfg.num_steps < 1:
+            raise ValueError(f"Corridor num_steps must be positive, got {cfg.num_steps}.")
+        num_steps = cfg.num_steps
+        step_height = target_step_height
+    else:
+        num_steps = max(1, int(round(cfg.rise_per_stair / target_step_height)))
         step_height = cfg.rise_per_stair / num_steps
+        while step_height > cfg.step_height_range[1]:
+            num_steps += 1
+            step_height = cfg.rise_per_stair / num_steps
     tread_easy, tread_hard = cfg.step_tread_range[1], cfg.step_tread_range[0]
     step_length = float(np.interp(difficulty, (0.0, 1.0), (tread_easy, tread_hard)))
     stair_run = step_length * num_steps
@@ -1921,6 +1928,19 @@ def corridor_terrain(
             local = trimesh.transformations.translation_matrix((0.5 * stair_run, wall_y, 0.5 * wall_total_height))
             add_box((stair_run, cfg.wall_thickness, wall_total_height), cursor @ local)
         guard_side = -wall_side if wall_side is not None else 1.0
+        post_size = min(cfg.stair_guardrail_thickness, step_length * 0.8)
+        post_y = guard_side * (0.5 * cfg.corridor_width - 0.5 * post_size)
+        for post_index in range(num_steps + 1):
+            post_x = step_length * post_index
+            post_base_z = step_height * post_index
+            post = trimesh.transformations.translation_matrix(
+                (post_x, post_y, post_base_z + 0.5 * cfg.stair_guardrail_height)
+            )
+            add_box(
+                (post_size, post_size, cfg.stair_guardrail_height),
+                cursor @ post,
+            )
+
         rail_y = guard_side * (0.5 * cfg.corridor_width - 0.5 * cfg.stair_guardrail_thickness)
         rail_length = float(np.hypot(stair_run, stair_rise))
         rail_pitch = -float(np.arctan2(stair_rise, stair_run))
@@ -1936,7 +1956,10 @@ def corridor_terrain(
         )
 
     def add_platform(cursor: np.ndarray, platform_length: float, platform_width: float, front_wall: bool) -> None:
-        floor = trimesh.transformations.translation_matrix((0.5 * platform_length, 0.0, 0.5 * step_height))
+        # ``cursor`` is already on the top surface of the preceding stair.
+        # Extend the platform slab downward so its walkable surface stays
+        # flush with that final tread instead of introducing an extra step.
+        floor = trimesh.transformations.translation_matrix((0.5 * platform_length, 0.0, -0.5 * step_height))
         floor_transform = cursor @ floor
         add_box((platform_length, platform_width, step_height), floor_transform)
         platform_center = floor_transform[:3, 3].copy()
@@ -1945,16 +1968,17 @@ def corridor_terrain(
         for side in (-1.0, 1.0):
             wall_y = side * (0.5 * platform_width + 0.5 * cfg.wall_thickness)
             wall = trimesh.transformations.translation_matrix(
-                (0.5 * platform_length, wall_y, step_height + 0.5 * cfg.wall_height)
+                (0.5 * platform_length, wall_y, 0.5 * cfg.wall_height)
             )
             add_box((platform_length, cfg.wall_thickness, cfg.wall_height), cursor @ wall)
         if front_wall:
             wall = trimesh.transformations.translation_matrix(
-                (platform_length + 0.5 * cfg.wall_thickness, 0.0, step_height + 0.5 * cfg.wall_height)
+                (platform_length + 0.5 * cfg.wall_thickness, 0.0, 0.5 * cfg.wall_height)
             )
             add_box((cfg.wall_thickness, platform_width, cfg.wall_height), cursor @ wall)
 
-    cursor = trimesh.transformations.translation_matrix((0.5 * width, 0.5 * length, 0.0))
+    terrain_center = np.array((0.5 * width, 0.5 * length, 0.0), dtype=np.float64)
+    cursor = trimesh.transformations.translation_matrix(terrain_center)
     aliases = {"left_turn": "left", "right_turn": "right"}
     components = [aliases.get(name, name) for name in cfg.component_types]
     u_turn_side = cfg.first_u_turn_side
@@ -1966,26 +1990,65 @@ def corridor_terrain(
         wall_side = (
             -1.0 if component == "left" else 1.0 if component == "right" else -float(u_turn_side or 1.0)
         )
+        incoming_end = cursor
         if segment_index == 0:
             add_stairs(cursor, wall_side)
-            cursor = cursor @ trimesh.transformations.translation_matrix((stair_run, 0.0, stair_rise))
+            incoming_end = cursor @ trimesh.transformations.translation_matrix((stair_run, 0.0, stair_rise))
 
         platform_length = cfg.u_turn_platform_length if component == "u_turn" else cfg.platform_length
         platform_width = 2.0 * cfg.corridor_width if component == "u_turn" else cfg.corridor_width
+        platform_cursor = incoming_end
         if not (component == "straight" and cfg.straight_skip_mid_platform):
-            platform_cursor = cursor
             if component == "u_turn":
                 platform_cursor = platform_cursor @ trimesh.transformations.translation_matrix(
                     (0.0, float(u_turn_side or 1.0) * 0.5 * cfg.corridor_width, 0.0)
                 )
             add_platform(platform_cursor, platform_length, platform_width, component != "straight")
-            cursor = cursor @ trimesh.transformations.translation_matrix((platform_length, 0.0, 0.0))
 
-        cursor = cursor @ trimesh.transformations.rotation_matrix(np.deg2rad(turn_degrees), (0.0, 0.0, 1.0))
+        # Start the outgoing stair at the appropriate edge of the middle
+        # platform.  In particular, a U-turn is a switchback: its outgoing
+        # lane is displaced sideways by one full corridor width and starts at
+        # the *near* edge of the platform.  Rotating at the far end without
+        # this displacement makes the stair overlap the platform/incoming
+        # lane and puts its entrance against the platform's front wall.
+        if component == "left":
+            outgoing_offset = (0.5 * platform_length, 0.5 * platform_width, 0.0)
+        elif component == "right":
+            outgoing_offset = (0.5 * platform_length, -0.5 * platform_width, 0.0)
+        elif component == "u_turn":
+            outgoing_offset = (0.0, float(u_turn_side or 1.0) * cfg.corridor_width, 0.0)
+        elif cfg.straight_skip_mid_platform:
+            outgoing_offset = (0.0, 0.0, 0.0)
+        else:
+            outgoing_offset = (platform_length, 0.0, 0.0)
+        cursor = (
+            incoming_end
+            @ trimesh.transformations.translation_matrix(outgoing_offset)
+            @ trimesh.transformations.rotation_matrix(np.deg2rad(turn_degrees), (0.0, 0.0, 1.0))
+        )
+
+        if not (component == "straight" and cfg.straight_skip_mid_platform):
+            if cfg.enable_mid_platform_spawn:
+                # Face the outgoing stair rather than the wall at the end of
+                # the incoming direction.
+                outgoing_center = cursor.copy()
+                outgoing_center[:3, 3] = platform_centers[-1]
+                platform_spawn_transforms.append((outgoing_center, True))
+
         add_stairs(cursor, wall_side)
         cursor = cursor @ trimesh.transformations.translation_matrix((stair_run, 0.0, stair_rise))
         if segment_index == cfg.segment_count - 1:
             add_platform(cursor, cfg.platform_length, cfg.corridor_width, True)
+            # The terminal platform remains the last navigation waypoint, but
+            # is intentionally not a reset spawn: every corridor spawn must
+            # have exactly one higher platform available as its next target.
+
+        if component == "u_turn":
+            # Alternate the switchback side so successive flights form a
+            # horizontal serpentine.  Reusing the same side puts every other
+            # flight directly above an earlier one; at the easiest 5 cm step
+            # height that leaves less than one metre of headroom for G1.
+            u_turn_side = -float(u_turn_side or 1.0)
 
     perimeter_specs = (
         (
@@ -2016,17 +2079,35 @@ def corridor_terrain(
                 trimesh.transformations.translation_matrix((x, y, 0.5 * cfg.perimeter_wall_height)),
             )
 
-    origin = np.array((0.5 * width, 0.5 * length, 0.0), dtype=np.float64)
+    # The first stair begins at terrain_center and initially points along +X.
+    # Put the default spawn one robot-height behind it so the policy has room
+    # to settle and approach the first step.
+    origin = terrain_center - np.array((cfg.initial_spawn_backoff, 0.0, 0.0), dtype=np.float64)
+    cfg.spawn_points_local = []
+    cfg.spawn_yaws = []
+    for transform, face_forward in platform_spawn_transforms:
+        point = np.asarray(transform[:3, 3], dtype=np.float64)
+        yaw = float(np.arctan2(transform[1, 0], transform[0, 0]))
+        if not face_forward:
+            yaw += np.pi
+        yaw = float((yaw + np.pi) % (2.0 * np.pi) - np.pi)
+        cfg.spawn_points_local.append((point - origin).tolist())
+        cfg.spawn_yaws.append(yaw)
+    cfg.spawn_yaw = cfg.spawn_yaws[-1] if cfg.spawn_yaws else 0.0
+    cfg.ordered_waypoints_local = [(point - origin).tolist() for point in platform_centers]
     flat_patches: dict[str, np.ndarray] | None = None
     if cfg.flat_patch_sampling is not None:
-        # PoseVelocityCommand requires target patches.  Reuse the final corridor
-        # platform as the navigation goal instead of sampling the open floor or
-        # the top of a perimeter wall.
+        # Keep all generated platform centers in traversal order.  The command
+        # term consumes ``ordered_waypoints_local`` for sequential navigation;
+        # tiling the same order here also keeps visualization/fallback sampling
+        # on safe walkable platforms rather than walls or the open floor.
         if len(platform_centers) == 0:
             raise RuntimeError("Corridor terrain did not generate a target platform.")
-        final_platform = platform_centers[-1]
         flat_patches = {
-            name: np.repeat(final_platform[None, :], patch_cfg.num_patches, axis=0)
+            name: np.asarray(
+                [platform_centers[index % len(platform_centers)] for index in range(patch_cfg.num_patches)],
+                dtype=np.float64,
+            )
             for name, patch_cfg in cfg.flat_patch_sampling.items()
         }
     output = TerrainOutput(origin=origin, geometries=geometries, flat_patches=flat_patches)
