@@ -315,6 +315,7 @@ def instinct_g1_d455_parkour_amp_cfg(*, play: bool = False):
             "yaw_stiffness": 2.0,
             "max_yaw_rate": 0.8,
             "std": 0.4,
+            "always_active": True,
         },
     )
     rewards["active_vision_wrong_height"] = RewardTermCfg(

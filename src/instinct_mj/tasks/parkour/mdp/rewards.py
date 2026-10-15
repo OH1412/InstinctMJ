@@ -410,6 +410,7 @@ def active_vision_body_follow_reward(
     yaw_stiffness: float = 2.0,
     max_yaw_rate: float = 0.8,
     std: float = 0.4,
+    always_active: bool = False,
     yaw_joint_name: str = "head_yaw_joint",
     yaw_joint_sign: float = 1.0,
     asset_cfg: SceneEntityCfg = SceneEntityCfg(
@@ -417,21 +418,16 @@ def active_vision_body_follow_reward(
     ),
 ) -> torch.Tensor:
     """Turn the torso toward the world-frame direction found by the camera."""
-    _, _, _, follow_active, gaze_heading_w = _corridor_active_vision_state(
-        env,
-        command_name,
-        terrain_camera_name,
-        scanner_name,
-        asset_cfg,
-        foot_height_offset,
-        target_height_threshold,
-        terrain_height_threshold,
-        detection_threshold,
-        follow_memory_s,
-        yaw_joint_name,
-        yaw_joint_sign,
-    )
     robot: Entity = env.scene[asset_cfg.name]
+    if always_active:
+        follow_active = torch.ones(env.num_envs, dtype=torch.bool, device=env.device)
+        gaze_heading_w = robot.data.heading_w + _head_yaw(env, yaw_joint_name, yaw_joint_sign)
+    else:
+        _, _, _, follow_active, gaze_heading_w = _corridor_active_vision_state(
+            env, command_name, terrain_camera_name, scanner_name, asset_cfg,
+            foot_height_offset, target_height_threshold, terrain_height_threshold,
+            detection_threshold, follow_memory_s, yaw_joint_name, yaw_joint_sign,
+        )
     heading_error = torch.atan2(
         torch.sin(gaze_heading_w - robot.data.heading_w),
         torch.cos(gaze_heading_w - robot.data.heading_w),
