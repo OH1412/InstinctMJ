@@ -66,5 +66,8 @@ class PoseVelocityCommandCfg(CommandTermCfg):
     patch_vis: bool = False
     """Whether to visualize all flat patches (can be expensive with many patches)."""
 
+    corridor_target_layer_offsets: tuple[int, ...] = ()
+    """Sample a fixed corridor goal relative to the spawn layer, including ground."""
+
     def build(self, env):
         return self.class_type(self, env)

@@ -68,6 +68,8 @@ def _corridor(side: float) -> MeshCorridorTerrainCfg:
 def instinct_g1_d455_parkour_amp_cfg(*, play: bool = False):
     """Build G1 parkour with HMV's 29 body + 2 D455 gimbal DoFs."""
     cfg = instinct_g1_parkour_amp_final_cfg(play=play, shoe=False)
+    # Show all task rewards, including the active-vision terms, in Viser.
+    cfg.viewer.reward_bar_max_terms = 128
     # Capacity only: the three height-field families produce 249 real startup
     # contacts and 993 constraints. These limits do not alter contact geometry.
     cfg.sim.nconmax = 512 if play else 256
@@ -195,11 +197,6 @@ def instinct_g1_d455_parkour_amp_cfg(*, play: bool = False):
     cfg.scene.sensors = tuple(cfg.scene.sensors) + tuple(extra_sensors)
 
     yaw = {"yaw_joint_name": "head_yaw_joint", "yaw_joint_sign": -1.0}
-    live_target_yaw = {
-        "command_name": "base_velocity",
-        "max_head_yaw": G1_31DOF_D455_CAMERA_YAW_RANGE[1],
-        **yaw,
-    }
     rewards = cfg.rewards["rewards"]
     # Do not reward merely remaining alive.  Locomotion and task progress
     # should account for the positive return instead.
@@ -231,16 +228,9 @@ def instinct_g1_d455_parkour_amp_cfg(*, play: bool = False):
     # toward the next waypoint without over-constraining the torso heading.
     rewards.pop("heading_error", None)
     rewards["dof_vel_limits"].params["velocity_limits"] = copy.deepcopy(G1_29DOF_JOINT_VELOCITY_LIMITS)
-    rewards["track_ang_vel_z_exp"] = RewardTermCfg(
-        func=parkour_mdp.track_ang_vel_z_exp,
-        weight=1.0,
-        params={"command_name": "base_velocity", "std": 0.5},
-    )
-    rewards["delta_yaw_reward"] = RewardTermCfg(
-        func=parkour_mdp.delta_yaw_command_reward,
-        weight=0.25,
-        params={"command_name": "base_velocity"},
-    )
+    # Disable both direct target-heading objectives.
+    rewards.pop("track_ang_vel_z_exp", None)
+    rewards.pop("delta_yaw_reward", None)
     rewards["camera_yaw_action_acc_l2"] = RewardTermCfg(
         func=parkour_mdp.camera_axis_action_acc_l2,
         weight=-0.025,
@@ -259,15 +249,51 @@ def instinct_g1_d455_parkour_amp_cfg(*, play: bool = False):
     # velocity-tracking reward (3.0 versus 2.0).
     rewards["corridor_target_height"] = RewardTermCfg(
         func=parkour_mdp.corridor_target_height_exp,
-        weight=3.0,
+        weight=7.0,
         params={
             "command_name": "base_velocity",
             "std": 1.0,
+            "height_tolerance": 0.05,
             "foot_height_offset": 0.035,
             "asset_cfg": SceneEntityCfg(
                 "robot",
                 body_names=("left_ankle_roll_link", "right_ankle_roll_link"),
             ),
+        },
+    )
+    active_vision_common = {
+        "command_name": "base_velocity",
+        "terrain_camera_name": "camera_terrain",
+        "scanner_name": "height_scanner",
+        "foot_height_offset": 0.035,
+        "target_height_threshold": 0.10,
+        "terrain_height_threshold": 0.08,
+        "detection_threshold": 0.15,
+        "follow_memory_s": 0.6,
+        "asset_cfg": SceneEntityCfg(
+            "robot",
+            body_names=("left_ankle_roll_link", "right_ankle_roll_link"),
+        ),
+        **yaw,
+    }
+    rewards["active_vision_height_search"] = RewardTermCfg(
+        func=parkour_mdp.active_vision_height_search_reward,
+        weight=2.0,
+        params={
+            **copy.deepcopy(active_vision_common),
+            "search_yaw_rate": 0.6,
+            "search_motion_scale": 0.25,
+            "open_space_scale": 0.35,
+        },
+    )
+    rewards["active_vision_body_follow"] = RewardTermCfg(
+        func=parkour_mdp.active_vision_body_follow_reward,
+        weight=5.0,
+        params={
+            **copy.deepcopy(active_vision_common),
+            "yaw_stiffness": 2.0,
+            "max_yaw_rate": 0.8,
+            "std": 0.4,
         },
     )
     rewards.pop("camera_yaw_side_start_penalty", None)
@@ -366,6 +392,7 @@ def instinct_g1_d455_parkour_amp_legacy_hmv_terrain_cfg(*, play: bool = False):
     terrain_gen.num_cols = len(terrain_gen.sub_terrains)
 
     command_cfg = cfg.commands["base_velocity"]
+    command_cfg.corridor_target_layer_offsets = (-2, -1, 1, 2)
     command_cfg.velocity_ranges = {
         name: copy.deepcopy(command_cfg.velocity_ranges[name])
         for name in ("pyramid_stairs", "pyramid_stairs_inv")

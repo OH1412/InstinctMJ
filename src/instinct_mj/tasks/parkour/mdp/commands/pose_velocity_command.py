@@ -152,6 +152,10 @@ class PoseVelocityCommand(CommandTerm):
             for env_id, subterrain_cfg in enumerate(subterrain_cfgs):
                 points = getattr(subterrain_cfg, "ordered_waypoints_local", None)
                 if points:
+                    if self.cfg.corridor_target_layer_offsets:
+                        # The corridor origin is the safe ground-level spawn;
+                        # generated platform centers start at the first landing.
+                        points = [[0.0, 0.0, 0.0]] + list(points)
                     ordered_waypoints[env_id] = points
                     self.ordered_waypoint_count[env_id] = len(points)
 
@@ -256,6 +260,21 @@ class PoseVelocityCommand(CommandTerm):
                 self.ordered_waypoint_index[reset_env_ids] = torch.where(
                     starts_on_waypoint, next_index, torch.zeros_like(next_index)
                 )
+                if self.cfg.corridor_target_layer_offsets:
+                    # Choose the spawn layer by height, using XY only to break
+                    # ties. Upper platforms may overlap ground in XY.
+                    sole_z = self.robot.data.root_link_pos_w[reset_env_ids, 2] - (
+                        self.robot.data.default_root_state[reset_env_ids, 2]
+                    )
+                    waypoint_z = self.ordered_waypoints_w[reset_env_ids, :, 2]
+                    height_error = torch.abs(waypoint_z - sole_z[:, None])
+                    layer_distance = torch.where(valid, height_error + 0.001 * distances, torch.inf)
+                    spawn_index = layer_distance.argmin(dim=1)
+                    offsets = torch.tensor(self.cfg.corridor_target_layer_offsets, device=self.device)
+                    candidates = spawn_index[:, None] + offsets[None, :]
+                    legal = (candidates >= 0) & (candidates < self.ordered_waypoint_count[reset_env_ids, None])
+                    choices = torch.rand(candidates.shape, device=self.device).masked_fill(~legal, -1.0).argmax(dim=1)
+                    self.ordered_waypoint_index[reset_env_ids] = candidates.gather(1, choices[:, None]).squeeze(1)
 
             waypoint_index = self.ordered_waypoint_index[ordered_env_ids]
             self.pos_command_w[ordered_env_ids] = self.ordered_waypoints_w[ordered_env_ids, waypoint_index]
@@ -313,7 +332,7 @@ class PoseVelocityCommand(CommandTerm):
         # Pure function of the current state; refreshing all envs is safe.
         del env_ids
         ordered_env_ids = (self.ordered_waypoint_count > 0).nonzero(as_tuple=False).flatten()
-        if len(ordered_env_ids) > 0:
+        if len(ordered_env_ids) > 0 and not self.cfg.corridor_target_layer_offsets:
             target_xy = self.pos_command_w[ordered_env_ids, :2]
             root_xy = self.robot.data.root_link_pos_w[ordered_env_ids, :2]
             reached = torch.linalg.vector_norm(target_xy - root_xy, dim=-1) <= self.cfg.target_dis_threshold

@@ -194,6 +194,206 @@ def _head_yaw(
     return yaw_joint_sign * robot.data.joint_pos[:, joint_ids[0]]
 
 
+def _corridor_active_vision_state(
+    env: ManagerBasedRlEnv,
+    command_name: str,
+    terrain_camera_name: str,
+    scanner_name: str,
+    asset_cfg: SceneEntityCfg,
+    foot_height_offset: float,
+    target_height_threshold: float,
+    terrain_height_threshold: float,
+    detection_threshold: float,
+    follow_memory_s: float,
+    yaw_joint_name: str,
+    yaw_joint_sign: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Detect a target-height-compatible surface while standing on flat ground.
+
+    Returns ``(search_active, evidence, openness, follow_active,
+    gaze_heading_w)``.  A short world-frame gaze-heading memory lets the torso
+    start following a discovered route even if the candidate surface briefly
+    leaves the image.
+    Results are cached because the camera and body rewards call this helper in
+    the same environment step.
+    """
+    step = int(env.common_step_counter)
+    if getattr(env, "_corridor_active_vision_last_step", None) == step:
+        return env._corridor_active_vision_cache
+
+    command_term = env.command_manager.get_term(command_name)
+    robot: Entity = env.scene[asset_cfg.name]
+    mean_sole_height = (
+        torch.mean(robot.data.body_link_pos_w[:, asset_cfg.body_ids, 2], dim=1) - foot_height_offset
+    )
+    target_height_delta = command_term.pos_command_w[:, 2] - mean_sole_height
+
+    # This under-body window remains flat while the robot is searching from a
+    # platform, then switches the rewards off as soon as it steps onto stairs.
+    scanner = env.scene[scanner_name]
+    hits = scanner.data.hit_pos_w
+    relative = hits - robot.data.root_link_pos_w.unsqueeze(1)
+    heading = robot.data.heading_w.unsqueeze(1)
+    local_x = torch.cos(heading) * relative[..., 0] + torch.sin(heading) * relative[..., 1]
+    local_y = -torch.sin(heading) * relative[..., 0] + torch.cos(heading) * relative[..., 1]
+    valid_ground = (scanner.data.distances >= 0.0) & torch.isfinite(hits).all(dim=-1)
+    valid_ground &= (local_x.abs() <= 0.25) & (local_y.abs() <= 0.30)
+    highest = torch.where(valid_ground, hits[..., 2], -torch.inf).amax(dim=1)
+    lowest = torch.where(valid_ground, hits[..., 2], torch.inf).amin(dim=1)
+    # Require actual ground observations. Large discontinuities and missing
+    # returns must never be classified as flat ground.
+    on_flat = (valid_ground.sum(dim=1) >= 4) & ((highest - lowest) < 0.05)
+    corridor = command_term.ordered_waypoint_count > 0
+    search_active = corridor & on_flat & (torch.abs(target_height_delta) > target_height_threshold)
+
+    camera = env.scene[terrain_camera_name]
+    ray_data = camera.raycast_data
+    image_shape = camera.image_shape
+    hit_z = ray_data.hit_pos_w[..., 2].reshape(env.num_envs, *image_shape)
+    normal_z = ray_data.normals_w[..., 2].reshape(env.num_envs, *image_shape)
+    valid = ray_data.distances.reshape(env.num_envs, *image_shape) >= 0.0
+    valid &= normal_z > 0.55  # Reject corridor walls and other near-vertical faces.
+
+    # Prefer searching through the open center of the image.  Near-vertical
+    # hits are treated as walls; ground and stair treads do not reduce the
+    # clearance score.  Looking along a corridor opening therefore scores
+    # higher than looking into either wall.
+    distances = ray_data.distances.reshape(env.num_envs, *image_shape)
+    wall = (distances >= 0.0) & (torch.abs(normal_z) < 0.45)
+    center_width = max(1, image_shape[1] // 2)
+    center_start = (image_shape[1] - center_width) // 2
+    center_end = center_start + center_width
+    center_wall = wall[:, :, center_start:center_end]
+    center_distance = distances[:, :, center_start:center_end]
+    no_wall_distance = torch.full_like(center_distance, float(camera.cfg.max_distance))
+    nearest_wall = torch.where(center_wall, center_distance, no_wall_distance).flatten(start_dim=1).amin(dim=1)
+    openness = torch.clamp((nearest_wall - 0.6) / 1.4, min=0.0, max=1.0)
+    openness *= search_active.float()
+
+    desired_sign = torch.sign(target_height_delta).view(-1, 1, 1)
+    signed_height = desired_sign * (hit_z - mean_sole_height.view(-1, 1, 1))
+    evidence_pixels = torch.clamp(
+        (signed_height - terrain_height_threshold) / 0.30,
+        min=0.0,
+        max=1.0,
+    ) * valid.float()
+    # A top-decile score detects a useful patch without letting the much larger
+    # amount of ordinary flat floor dilute it to zero.
+    flat_evidence = evidence_pixels.flatten(start_dim=1)
+    top_k = max(1, flat_evidence.shape[1] // 10)
+    evidence = torch.topk(flat_evidence, k=top_k, dim=1).values.mean(dim=1)
+    evidence *= search_active.float()
+    found = search_active & (evidence >= detection_threshold)
+
+    if not hasattr(env, "_corridor_active_vision_follow_time"):
+        env._corridor_active_vision_follow_time = torch.zeros(env.num_envs, device=env.device)
+        env._corridor_active_vision_gaze_heading_w = torch.zeros(env.num_envs, device=env.device)
+    follow_time = env._corridor_active_vision_follow_time
+    gaze_heading_w = env._corridor_active_vision_gaze_heading_w
+
+    reset = (env.episode_length_buf <= 1) | ~search_active
+    follow_time[reset] = 0.0
+    camera_heading_w = robot.data.heading_w + _head_yaw(env, yaw_joint_name, yaw_joint_sign)
+    camera_heading_w = torch.atan2(torch.sin(camera_heading_w), torch.cos(camera_heading_w))
+    gaze_heading_w[found] = camera_heading_w[found]
+    follow_time[found] = follow_memory_s
+    follow_time[~found] = torch.clamp(follow_time[~found] - env.step_dt, min=0.0)
+    follow_active = search_active & (follow_time > 0.0)
+
+    result = (search_active, evidence, openness, follow_active, gaze_heading_w)
+    env._corridor_active_vision_last_step = step
+    env._corridor_active_vision_cache = result
+    return result
+
+
+def active_vision_height_search_reward(
+    env: ManagerBasedRlEnv,
+    command_name: str,
+    terrain_camera_name: str = "camera_terrain",
+    scanner_name: str = "height_scanner",
+    foot_height_offset: float = 0.035,
+    target_height_threshold: float = 0.10,
+    terrain_height_threshold: float = 0.08,
+    detection_threshold: float = 0.15,
+    follow_memory_s: float = 0.6,
+    search_yaw_rate: float = 0.6,
+    search_motion_scale: float = 0.25,
+    open_space_scale: float = 0.35,
+    yaw_joint_name: str = "head_yaw_joint",
+    yaw_joint_sign: float = 1.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg(
+        "robot", body_names=("left_ankle_roll_link", "right_ankle_roll_link")
+    ),
+) -> torch.Tensor:
+    """Encourage camera scanning, then reward seeing terrain at the target height."""
+    search_active, evidence, openness, follow_active, _ = _corridor_active_vision_state(
+        env,
+        command_name,
+        terrain_camera_name,
+        scanner_name,
+        asset_cfg,
+        foot_height_offset,
+        target_height_threshold,
+        terrain_height_threshold,
+        detection_threshold,
+        follow_memory_s,
+        yaw_joint_name,
+        yaw_joint_sign,
+    )
+    robot: Entity = env.scene[asset_cfg.name]
+    joint_ids, _ = robot.find_joints((yaw_joint_name,), preserve_order=True)
+    yaw_rate = torch.abs(robot.data.joint_vel[:, joint_ids[0]])
+    scan_reward = search_motion_scale * torch.clamp(yaw_rate / search_yaw_rate, min=0.0, max=1.0)
+    search_reward = scan_reward + open_space_scale * openness
+    # Detection replaces the generic scan incentive, preventing endless
+    # oscillation once the relevant terrain is in view.
+    return search_active.float() * torch.where(follow_active, evidence, search_reward)
+
+
+def active_vision_body_follow_reward(
+    env: ManagerBasedRlEnv,
+    command_name: str,
+    terrain_camera_name: str = "camera_terrain",
+    scanner_name: str = "height_scanner",
+    foot_height_offset: float = 0.035,
+    target_height_threshold: float = 0.10,
+    terrain_height_threshold: float = 0.08,
+    detection_threshold: float = 0.15,
+    follow_memory_s: float = 0.6,
+    yaw_stiffness: float = 2.0,
+    max_yaw_rate: float = 0.8,
+    std: float = 0.4,
+    yaw_joint_name: str = "head_yaw_joint",
+    yaw_joint_sign: float = 1.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg(
+        "robot", body_names=("left_ankle_roll_link", "right_ankle_roll_link")
+    ),
+) -> torch.Tensor:
+    """Turn the torso toward the world-frame direction found by the camera."""
+    _, _, _, follow_active, gaze_heading_w = _corridor_active_vision_state(
+        env,
+        command_name,
+        terrain_camera_name,
+        scanner_name,
+        asset_cfg,
+        foot_height_offset,
+        target_height_threshold,
+        terrain_height_threshold,
+        detection_threshold,
+        follow_memory_s,
+        yaw_joint_name,
+        yaw_joint_sign,
+    )
+    robot: Entity = env.scene[asset_cfg.name]
+    heading_error = torch.atan2(
+        torch.sin(gaze_heading_w - robot.data.heading_w),
+        torch.cos(gaze_heading_w - robot.data.heading_w),
+    )
+    target_yaw_rate = torch.clamp(yaw_stiffness * heading_error, min=-max_yaw_rate, max=max_yaw_rate)
+    yaw_rate_error = robot.data.root_link_ang_vel_b[:, 2] - target_yaw_rate
+    return follow_active.float() * torch.exp(-torch.square(yaw_rate_error) / std**2)
+
+
 def _navigation_target_head_yaw(
     env: ManagerBasedRlEnv,
     command_name: str,
@@ -496,30 +696,43 @@ class delayed_stuck_penalty(ManagerTermBase):
         return (active & self._is_stuck).float()
 
 
-def corridor_target_height_exp(
-    env: ManagerBasedRlEnv,
-    command_name: str,
-    std: float,
-    foot_height_offset: float = 0.035,
-    asset_cfg: SceneEntityCfg = SceneEntityCfg(
-        "robot", body_names=("left_ankle_roll_link", "right_ankle_roll_link")
-    ),
-) -> torch.Tensor:
-    """Reward the feet for approaching the active corridor waypoint height.
+class corridor_target_height_exp(ManagerTermBase):
+    """Reward approaching platform height until its tolerance is first reached."""
 
-    Ordered waypoints are only present on corridor terrains.  The ankle-link
-    origins sit above the soles, so ``foot_height_offset`` converts their mean
-    height to an approximate sole-plane height before comparing it with the
-    platform target Z.
-    """
-    command_term = env.command_manager.get_term(command_name)
-    robot: Entity = env.scene[asset_cfg.name]
-    mean_sole_height = (
-        torch.mean(robot.data.body_link_pos_w[:, asset_cfg.body_ids, 2], dim=1) - foot_height_offset
-    )
-    height_error = torch.abs(mean_sole_height - command_term.pos_command_w[:, 2])
-    corridor_mask = command_term.ordered_waypoint_count > 0
-    return corridor_mask.float() * torch.exp(-height_error / std)
+    def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv):
+        super().__init__(env)
+        self._completed = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+        self._target = torch.zeros(env.num_envs, 3, device=env.device)
+
+    def reset(self, env_ids: Sequence[int] | torch.Tensor | slice | None = None) -> None:
+        index = slice(None) if env_ids is None else env_ids
+        self._completed[index] = False
+        self._target[index] = 0.0
+
+    def __call__(
+        self,
+        env: ManagerBasedRlEnv,
+        command_name: str,
+        std: float,
+        foot_height_offset: float = 0.035,
+        height_tolerance: float = 0.05,
+        asset_cfg: SceneEntityCfg = SceneEntityCfg(
+            "robot", body_names=("left_ankle_roll_link", "right_ankle_roll_link")
+        ),
+    ) -> torch.Tensor:
+        command_term = env.command_manager.get_term(command_name)
+        robot: Entity = env.scene[asset_cfg.name]
+        target = command_term.pos_command_w
+        changed = torch.linalg.vector_norm(target - self._target, dim=1) > 1.0e-4
+        self._completed[changed | (env.episode_length_buf <= 1)] = False
+        self._target.copy_(target)
+        mean_sole_height = (
+            torch.mean(robot.data.body_link_pos_w[:, asset_cfg.body_ids, 2], dim=1) - foot_height_offset
+        )
+        height_error = torch.abs(mean_sole_height - target[:, 2])
+        corridor_mask = command_term.ordered_waypoint_count > 0
+        self._completed |= corridor_mask & (height_error <= height_tolerance)
+        return (corridor_mask & ~self._completed).float() * torch.exp(-height_error / std)
 
 
 def stand_still(
