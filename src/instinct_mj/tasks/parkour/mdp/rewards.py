@@ -36,6 +36,22 @@ def track_lin_vel_xy_exp(
     return torch.exp(-lin_vel_error / std**2)
 
 
+def track_lin_vel_xy_after_height_exp(
+    env: ManagerBasedRlEnv,
+    command_name: str,
+    std: float,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Enable planar tracking only after the corridor height objective completes."""
+    height_cfg = env.reward_manager.get_term_cfg("corridor_target_height", group_name="rewards")
+    # Refresh the shared height latch before checking it: planar tracking is
+    # evaluated earlier in the reward list. The height term is idempotent.
+    height_cfg.func(env, **height_cfg.params)
+    corridor = env.command_manager.get_term(command_name).ordered_waypoint_count > 0
+    enabled = ~corridor | height_cfg.func._completed
+    return enabled.float() * track_lin_vel_xy_exp(env, command_name, std, asset_cfg)
+
+
 def track_ang_vel_z_exp(
     env: ManagerBasedRlEnv,
     command_name: str,
@@ -232,17 +248,10 @@ def _corridor_active_vision_state(
     # platform, then switches the rewards off as soon as it steps onto stairs.
     scanner = env.scene[scanner_name]
     hits = scanner.data.hit_pos_w
-    relative = hits - robot.data.root_link_pos_w.unsqueeze(1)
-    heading = robot.data.heading_w.unsqueeze(1)
-    local_x = torch.cos(heading) * relative[..., 0] + torch.sin(heading) * relative[..., 1]
-    local_y = -torch.sin(heading) * relative[..., 0] + torch.cos(heading) * relative[..., 1]
     valid_ground = (scanner.data.distances >= 0.0) & torch.isfinite(hits).all(dim=-1)
-    valid_ground &= (local_x.abs() <= 0.25) & (local_y.abs() <= 0.30)
-    highest = torch.where(valid_ground, hits[..., 2], -torch.inf).amax(dim=1)
-    lowest = torch.where(valid_ground, hits[..., 2], torch.inf).amin(dim=1)
-    # Require actual ground observations. Large discontinuities and missing
-    # returns must never be classified as flat ground.
-    on_flat = (valid_ground.sum(dim=1) >= 4) & ((highest - lowest) < 0.05)
+    # Dedicated camera-yaw-aligned sensor: current camera ground projection
+    # and exactly 0.25 m ahead. Both downward rays must hit valid terrain.
+    on_flat = valid_ground.all(dim=1) & ((hits[:, 1, 2] - hits[:, 0, 2]).abs() < 0.05)
     corridor = command_term.ordered_waypoint_count > 0
     search_active = corridor & on_flat & (torch.abs(target_height_delta) > target_height_threshold)
 
@@ -283,7 +292,17 @@ def _corridor_active_vision_state(
     top_k = max(1, flat_evidence.shape[1] // 10)
     evidence = torch.topk(flat_evidence, k=top_k, dim=1).values.mean(dim=1)
     evidence *= search_active.float()
-    found = search_active & (evidence >= detection_threshold)
+    opposite_pixels = torch.clamp(
+        (-signed_height - terrain_height_threshold) / 0.30, min=0.0, max=1.0
+    ) * valid.float()
+    opposite = torch.topk(opposite_pixels.flatten(start_dim=1), k=top_k, dim=1).values.mean(dim=1)
+    opposite *= search_active.float()
+    # Mixed views may contain both stair directions. Reject following when
+    # the wrong-height evidence dominates the compatible evidence.
+    wrong_direction = (opposite >= detection_threshold) & (opposite > evidence)
+    env._corridor_active_vision_wrong_height = opposite
+    openness *= 1.0 - opposite
+    found = search_active & (evidence >= detection_threshold) & ~wrong_direction
 
     if not hasattr(env, "_corridor_active_vision_follow_time"):
         env._corridor_active_vision_follow_time = torch.zeros(env.num_envs, device=env.device)
@@ -291,7 +310,7 @@ def _corridor_active_vision_state(
     follow_time = env._corridor_active_vision_follow_time
     gaze_heading_w = env._corridor_active_vision_gaze_heading_w
 
-    reset = (env.episode_length_buf <= 1) | ~search_active
+    reset = (env.episode_length_buf <= 1) | ~search_active | wrong_direction
     follow_time[reset] = 0.0
     camera_heading_w = robot.data.heading_w + _head_yaw(env, yaw_joint_name, yaw_joint_sign)
     camera_heading_w = torch.atan2(torch.sin(camera_heading_w), torch.cos(camera_heading_w))
@@ -347,7 +366,35 @@ def active_vision_height_search_reward(
     search_reward = scan_reward + open_space_scale * openness
     # Detection replaces the generic scan incentive, preventing endless
     # oscillation once the relevant terrain is in view.
-    return search_active.float() * torch.where(follow_active, evidence, search_reward)
+    return search_active.float() * torch.where(
+        follow_active, evidence, search_reward * (1.0 - env._corridor_active_vision_wrong_height)
+    )
+
+
+def active_vision_wrong_height_penalty(
+    env: ManagerBasedRlEnv,
+    command_name: str,
+    terrain_camera_name: str = "camera_terrain",
+    scanner_name: str = "camera_forward_ground",
+    foot_height_offset: float = 0.035,
+    target_height_threshold: float = 0.10,
+    terrain_height_threshold: float = 0.08,
+    detection_threshold: float = 0.15,
+    follow_memory_s: float = 0.6,
+    yaw_joint_name: str = "head_yaw_joint",
+    yaw_joint_sign: float = 1.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg(
+        "robot", body_names=("left_ankle_roll_link", "right_ankle_roll_link")
+    ),
+) -> torch.Tensor:
+    """Penalize viewing terrain opposite to the required ascent/descent."""
+    _corridor_active_vision_state(
+        env, command_name, terrain_camera_name, scanner_name, asset_cfg,
+        foot_height_offset, target_height_threshold, terrain_height_threshold,
+        detection_threshold, follow_memory_s, yaw_joint_name, yaw_joint_sign,
+    )
+    opposite = env._corridor_active_vision_wrong_height
+    return torch.where(opposite >= detection_threshold, opposite, torch.zeros_like(opposite))
 
 
 def active_vision_body_follow_reward(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import math
+from dataclasses import dataclass
 
 from mjlab.envs.mdp.actions import JointPositionActionCfg
 from mjlab.managers import ObservationTermCfg, RewardTermCfg, SceneEntityCfg
@@ -33,6 +34,16 @@ from instinct_mj.sensors import GroupedRayCasterCfg
 from instinct_mj.tasks.parkour.config.g1.g1_parkour_target_amp_cfg import instinct_g1_parkour_amp_final_cfg
 from instinct_mj.terrains.terrain_generator_cfg import FlatPatchSamplingCfg
 from instinct_mj.terrains.trimesh import MeshCorridorTerrainCfg
+
+
+@dataclass
+class CameraForwardGroundPatternCfg(GridPatternCfg):
+    """Two downward rays at camera-local horizontal distances 0 and 0.25 m."""
+
+    def generate_rays(self, mj_model=None, device="cpu"):
+        offsets, directions = super().generate_rays(mj_model, device)
+        offsets[:, 0] += 0.125
+        return offsets, directions
 
 
 def _corridor(side: float) -> MeshCorridorTerrainCfg:
@@ -164,7 +175,16 @@ def instinct_g1_d455_parkour_amp_cfg(*, play: bool = False):
         track_air_time=False,
         history_length=3,
     )
-    extra_sensors = [height_scanner, terrain_camera, arm_contact_sensor]
+    flat_ground_sensor = GroupedRayCasterCfg(
+        name="camera_forward_ground",
+        frame=ObjRef(type="body", name="d455_link", entity="robot"),
+        pattern=CameraForwardGroundPatternCfg(resolution=0.25, size=(0.25, 0.0)),
+        ray_alignment="yaw",
+        max_distance=10.0,
+        mesh_prim_paths=["/World/ground/"],
+        debug_vis=False,
+    )
+    extra_sensors = [height_scanner, terrain_camera, arm_contact_sensor, flat_ground_sensor]
     if play:
         # Add a render-only MuJoCo camera so mjlab's Viser camera panel can
         # provide its native depth preview and Frustum checkbox.  Training and
@@ -198,6 +218,7 @@ def instinct_g1_d455_parkour_amp_cfg(*, play: bool = False):
 
     yaw = {"yaw_joint_name": "head_yaw_joint", "yaw_joint_sign": -1.0}
     rewards = cfg.rewards["rewards"]
+    rewards["track_lin_vel_xy_exp"].func = parkour_mdp.track_lin_vel_xy_after_height_exp
     # Do not reward merely remaining alive.  Locomotion and task progress
     # should account for the positive return instead.
     rewards.pop("is_alive", None)
@@ -264,7 +285,7 @@ def instinct_g1_d455_parkour_amp_cfg(*, play: bool = False):
     active_vision_common = {
         "command_name": "base_velocity",
         "terrain_camera_name": "camera_terrain",
-        "scanner_name": "height_scanner",
+        "scanner_name": "camera_forward_ground",
         "foot_height_offset": 0.035,
         "target_height_threshold": 0.10,
         "terrain_height_threshold": 0.08,
@@ -295,6 +316,11 @@ def instinct_g1_d455_parkour_amp_cfg(*, play: bool = False):
             "max_yaw_rate": 0.8,
             "std": 0.4,
         },
+    )
+    rewards["active_vision_wrong_height"] = RewardTermCfg(
+        func=parkour_mdp.active_vision_wrong_height_penalty,
+        weight=-2.0,
+        params=copy.deepcopy(active_vision_common),
     )
     rewards.pop("camera_yaw_side_start_penalty", None)
     rewards.pop("head_body_yaw_l2", None)
