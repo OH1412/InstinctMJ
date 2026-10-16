@@ -38,11 +38,11 @@ from instinct_mj.terrains.trimesh import MeshCorridorTerrainCfg
 
 @dataclass
 class CameraForwardGroundPatternCfg(GridPatternCfg):
-    """Two downward rays at camera-local horizontal distances 0 and 0.25 m."""
+    """Two downward rays at camera-local horizontal distances 0 and 1 m."""
 
     def generate_rays(self, mj_model=None, device="cpu"):
         offsets, directions = super().generate_rays(mj_model, device)
-        offsets[:, 0] += 0.125
+        offsets[:, 0] += 0.5 * self.size[0]
         return offsets, directions
 
 
@@ -65,7 +65,8 @@ def _corridor(side: float) -> MeshCorridorTerrainCfg:
         step_tread_range=(0.17, 0.25),
         component_types=["u_turn"],
         first_u_turn_side=side,
-        initial_spawn_backoff=1.3,
+        initial_spawn_backoff=0.6,
+        platform_spawn_clearance=0.5,
         flat_patch_sampling={
             "target": FlatPatchSamplingCfg(
                 num_patches=50,
@@ -160,6 +161,8 @@ def instinct_g1_d455_parkour_amp_cfg(*, play: bool = False):
     )
     terrain_camera = copy.deepcopy(camera)
     terrain_camera.name = "camera_terrain"
+    # Reward-only sensing: leave pretrained policy depth range unchanged.
+    terrain_camera.max_distance = 5.0
     terrain_camera.mesh_prim_paths = ["/World/ground/"]
     terrain_camera.noise_pipeline = {}
     terrain_camera.data_histories = {}
@@ -178,7 +181,7 @@ def instinct_g1_d455_parkour_amp_cfg(*, play: bool = False):
     flat_ground_sensor = GroupedRayCasterCfg(
         name="camera_forward_ground",
         frame=ObjRef(type="body", name="d455_link", entity="robot"),
-        pattern=CameraForwardGroundPatternCfg(resolution=0.25, size=(0.25, 0.0)),
+        pattern=CameraForwardGroundPatternCfg(resolution=1.0, size=(1.0, 0.0)),
         ray_alignment="yaw",
         max_distance=10.0,
         mesh_prim_paths=["/World/ground/"],
@@ -219,6 +222,13 @@ def instinct_g1_d455_parkour_amp_cfg(*, play: bool = False):
     yaw = {"yaw_joint_name": "head_yaw_joint", "yaw_joint_sign": -1.0}
     rewards = cfg.rewards["rewards"]
     rewards["track_lin_vel_xy_exp"].func = parkour_mdp.track_lin_vel_xy_after_height_exp
+    rewards["track_lin_vel_xy_exp"].params.update({
+        "foot_height_offset": 0.035,
+        "height_threshold": 0.10,
+        "feet_cfg": SceneEntityCfg(
+            "robot", body_names=("left_ankle_roll_link", "right_ankle_roll_link")
+        ),
+    })
     # Do not reward merely remaining alive.  Locomotion and task progress
     # should account for the positive return instead.
     rewards.pop("is_alive", None)
@@ -265,20 +275,20 @@ def instinct_g1_d455_parkour_amp_cfg(*, play: bool = False):
     # No directional camera-yaw objective: the head may choose its yaw freely.
     rewards.pop("camera_yaw_target", None)
     rewards.pop("camera_yaw_target_error_l2", None)
-    # Corridor waypoints encode the next platform height.  This term is gated
-    # to ordered-waypoint (corridor) environments and outweighs the planar
-    # velocity-tracking reward (3.0 versus 2.0).
+    # Signed per-step progress toward the live corridor target height.
     rewards["corridor_target_height"] = RewardTermCfg(
         func=parkour_mdp.corridor_target_height_exp,
-        weight=7.0,
+        weight=4.0,
         params={
             "command_name": "base_velocity",
             "std": 1.0,
             "height_tolerance": 0.05,
-            "foot_height_offset": 0.035,
+            "progress_speed": 0.3,
+            # Calibrated from the G1 D455 nominal joint pose via MuJoCo FK.
+            "hip_height_offset": 0.6539980295944118,
             "asset_cfg": SceneEntityCfg(
                 "robot",
-                body_names=("left_ankle_roll_link", "right_ankle_roll_link"),
+                body_names=("left_hip_pitch_link", "right_hip_pitch_link"),
             ),
         },
     )
@@ -288,7 +298,7 @@ def instinct_g1_d455_parkour_amp_cfg(*, play: bool = False):
         "scanner_name": "camera_forward_ground",
         "foot_height_offset": 0.035,
         "target_height_threshold": 0.10,
-        "terrain_height_threshold": 0.08,
+        "terrain_height_threshold": 0.03,
         "detection_threshold": 0.15,
         "follow_memory_s": 0.6,
         "asset_cfg": SceneEntityCfg(
@@ -297,19 +307,26 @@ def instinct_g1_d455_parkour_amp_cfg(*, play: bool = False):
         ),
         **yaw,
     }
-    rewards["active_vision_height_search"] = RewardTermCfg(
+    rewards["active_height_search"] = RewardTermCfg(
         func=parkour_mdp.active_vision_height_search_reward,
         weight=2.0,
         params={
             **copy.deepcopy(active_vision_common),
-            "search_yaw_rate": 0.6,
-            "search_motion_scale": 0.25,
-            "open_space_scale": 0.35,
         },
+    )
+    rewards["active_vision_open_space"] = RewardTermCfg(
+        func=parkour_mdp.active_vision_open_space_reward,
+        weight=0.7,
+        params=copy.deepcopy(active_vision_common),
+    )
+    rewards["active_vision_scan"] = RewardTermCfg(
+        func=parkour_mdp.active_vision_scan_reward,
+        weight=0.5,
+        params={**copy.deepcopy(active_vision_common), "search_yaw_rate": 0.6},
     )
     rewards["active_vision_body_follow"] = RewardTermCfg(
         func=parkour_mdp.active_vision_body_follow_reward,
-        weight=5.0,
+        weight=1.5,
         params={
             **copy.deepcopy(active_vision_common),
             "yaw_stiffness": 2.0,
@@ -320,7 +337,7 @@ def instinct_g1_d455_parkour_amp_cfg(*, play: bool = False):
     )
     rewards["active_vision_wrong_height"] = RewardTermCfg(
         func=parkour_mdp.active_vision_wrong_height_penalty,
-        weight=-2.0,
+        weight=-3.0,
         params=copy.deepcopy(active_vision_common),
     )
     rewards.pop("camera_yaw_side_start_penalty", None)
@@ -393,7 +410,7 @@ def instinct_g1_d455_parkour_amp_legacy_terrain_cfg(*, play: bool = False):
 
 
 def instinct_g1_d455_parkour_amp_legacy_hmv_terrain_cfg(*, play: bool = False):
-    """Train on pyramid stairs (40%) and HMV U-turn corridors (60%)."""
+    """Pyramids 40%, quarter-turn spirals 60%; retain switchbacks at zero."""
     cfg = instinct_g1_d455_parkour_amp_legacy_terrain_cfg(play=play)
     terrain_gen = cfg.scene.terrain.terrain_generator
 
@@ -409,9 +426,18 @@ def instinct_g1_d455_parkour_amp_legacy_hmv_terrain_cfg(*, play: bool = False):
         "pyramid_stairs_inv": pyramid_stairs_inv,
     }
     terrain_gen.sub_terrains["corridor_left"] = _corridor(1.0)
-    terrain_gen.sub_terrains["corridor_left"].proportion = 0.3
+    terrain_gen.sub_terrains["corridor_left"].proportion = 0.0
     terrain_gen.sub_terrains["corridor_right"] = _corridor(-1.0)
-    terrain_gen.sub_terrains["corridor_right"].proportion = 0.3
+    terrain_gen.sub_terrains["corridor_right"].proportion = 0.0
+    for name, side in (("spiral_left", 1.0), ("spiral_right", -1.0)):
+        stairs = _corridor(side)
+        stairs.proportion = 0.3
+        stairs.component_types = ["left" if side > 0 else "right"]
+        stairs.spiral_quarter_turn = True
+        stairs.wall_height = 1.6
+        stairs.segment_count = 4
+        stairs.platform_length = stairs.corridor_width
+        terrain_gen.sub_terrains[name] = stairs
 
     # Curriculum generation uses one column per terrain in insertion order.
     # Keeping the configured count aligned also makes command assignment and
@@ -419,7 +445,7 @@ def instinct_g1_d455_parkour_amp_legacy_hmv_terrain_cfg(*, play: bool = False):
     terrain_gen.num_cols = len(terrain_gen.sub_terrains)
 
     command_cfg = cfg.commands["base_velocity"]
-    command_cfg.corridor_target_layer_offsets = (-2, -1, 1, 2)
+    command_cfg.corridor_target_layer_offsets = (1, 2)
     command_cfg.velocity_ranges = {
         name: copy.deepcopy(command_cfg.velocity_ranges[name])
         for name in ("pyramid_stairs", "pyramid_stairs_inv")
@@ -432,6 +458,8 @@ def instinct_g1_d455_parkour_amp_legacy_hmv_terrain_cfg(*, play: bool = False):
     }
     command_cfg.velocity_ranges["corridor_left"] = copy.deepcopy(corridor_velocity_range)
     command_cfg.velocity_ranges["corridor_right"] = copy.deepcopy(corridor_velocity_range)
+    command_cfg.velocity_ranges["spiral_left"] = copy.deepcopy(corridor_velocity_range)
+    command_cfg.velocity_ranges["spiral_right"] = copy.deepcopy(corridor_velocity_range)
     reset_base = cfg.events["reset_base"]
     reset_base.func = parkour_mdp.reset_root_state_uniform_with_terrain_spawn
     reset_base.params.update(
@@ -441,4 +469,23 @@ def instinct_g1_d455_parkour_amp_legacy_hmv_terrain_cfg(*, play: bool = False):
             "validate_spawn_metadata": True,
         }
     )
+    return cfg
+
+
+def instinct_g1_d455_parkour_amp_spiral_terrain_cfg(*, play: bool = False):
+    """Separate 90-degree spiral profile; preserve the switchback task."""
+    cfg = instinct_g1_d455_parkour_amp_legacy_hmv_terrain_cfg(play=play)
+    generator = cfg.scene.terrain.terrain_generator
+    for name, side in (("spiral_left", 1.0), ("spiral_right", -1.0)):
+        stairs = generator.sub_terrains[name]
+        stairs.component_types = ["left" if side > 0 else "right"]
+        stairs.spiral_quarter_turn = True
+        stairs.wall_height = 1.6
+        # Four quarter-turn landings; fifth flight demonstrates that heading
+        # has returned to the first flight's direction. Square landings ensure
+        # flights above the first revolution align without horizontal drift.
+        stairs.segment_count = 4
+        stairs.platform_length = stairs.corridor_width
+        # Lowest difficulty: 4*10*0.05 = 2 m vertical separation per revolution.
+        # No floor-to-ceiling change is obtained by shrinking the tread depth.
     return cfg

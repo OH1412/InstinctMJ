@@ -1922,11 +1922,21 @@ def corridor_terrain(
                 (step_length * (index + 0.5), 0.0, step_height * (index + 0.5))
             )
             add_box((step_length, cfg.corridor_width, step_height), cursor @ local)
-        if wall_side is not None:
+        if wall_side is not None and not cfg.spiral_quarter_turn:
             wall_y = wall_side * (0.5 * cfg.corridor_width + 0.5 * cfg.wall_thickness)
             wall_total_height = stair_rise + cfg.wall_height
             local = trimesh.transformations.translation_matrix((0.5 * stair_run, wall_y, 0.5 * wall_total_height))
             add_box((stair_run, cfg.wall_thickness, wall_total_height), cursor @ local)
+        elif wall_side is not None:
+            # A stepped parapet follows each tread instead of a full-height
+            # rectangular wall that can obstruct the next quarter turn.
+            wall_y = wall_side * (0.5 * cfg.corridor_width + 0.5 * cfg.wall_thickness)
+            for index in range(num_steps):
+                local = trimesh.transformations.translation_matrix(
+                    (step_length * (index + 0.5), wall_y,
+                     step_height * (index + 1) + 0.5 * cfg.wall_height)
+                )
+                add_box((step_length, cfg.wall_thickness, cfg.wall_height), cursor @ local)
         guard_side = -wall_side if wall_side is not None else 1.0
         post_size = min(cfg.stair_guardrail_thickness, step_length * 0.8)
         post_y = guard_side * (0.5 * cfg.corridor_width - 0.5 * post_size)
@@ -1955,7 +1965,7 @@ def corridor_terrain(
             cursor @ local,
         )
 
-    def add_platform(cursor: np.ndarray, platform_length: float, platform_width: float, front_wall: bool) -> None:
+    def add_platform(cursor: np.ndarray, platform_length: float, platform_width: float, front_wall: bool, open_side: float | None = None) -> None:
         # ``cursor`` is already on the top surface of the preceding stair.
         # Extend the platform slab downward so its walkable surface stays
         # flush with that final tread instead of introducing an extra step.
@@ -1965,13 +1975,36 @@ def corridor_terrain(
         platform_center = floor_transform[:3, 3].copy()
         platform_center[2] += 0.5 * step_height
         platform_centers.append(platform_center)
-        for side in (-1.0, 1.0):
+        for side in (() if cfg.spiral_quarter_turn else (-1.0, 1.0)):
+            if side == open_side:
+                continue
             wall_y = side * (0.5 * platform_width + 0.5 * cfg.wall_thickness)
             wall = trimesh.transformations.translation_matrix(
                 (0.5 * platform_length, wall_y, 0.5 * cfg.wall_height)
             )
             add_box((platform_length, cfg.wall_thickness, cfg.wall_height), cursor @ wall)
-        if front_wall:
+        if cfg.spiral_quarter_turn and open_side is not None:
+            # Two outer landing edges only. Incoming (-X) and outgoing side
+            # remain open, so the stair entrances cannot be sealed by walls.
+            closed_side = -open_side
+            for extents, position in (
+                ((platform_length, cfg.wall_thickness, cfg.wall_height),
+                 (0.5 * platform_length, closed_side * (0.5 * platform_width + 0.5 * cfg.wall_thickness), 0.5 * cfg.wall_height)),
+                ((cfg.wall_thickness, platform_width, cfg.wall_height),
+                 (platform_length + 0.5 * cfg.wall_thickness, 0.0, 0.5 * cfg.wall_height)),
+            ):
+                add_box(extents, cursor @ trimesh.transformations.translation_matrix(position))
+        elif cfg.spiral_quarter_turn and front_wall:
+            # Terminal landing has no outgoing flight; protect all three
+            # exposed edges, leaving the incoming stair open.
+            for side in (-1.0, 1.0):
+                wall = trimesh.transformations.translation_matrix(
+                    (0.5 * platform_length, side * (0.5 * platform_width + 0.5 * cfg.wall_thickness), 0.5 * cfg.wall_height))
+                add_box((platform_length, cfg.wall_thickness, cfg.wall_height), cursor @ wall)
+            wall = trimesh.transformations.translation_matrix(
+                (platform_length + 0.5 * cfg.wall_thickness, 0.0, 0.5 * cfg.wall_height))
+            add_box((cfg.wall_thickness, platform_width, cfg.wall_height), cursor @ wall)
+        if front_wall and not cfg.spiral_quarter_turn:
             wall = trimesh.transformations.translation_matrix(
                 (platform_length + 0.5 * cfg.wall_thickness, 0.0, 0.5 * cfg.wall_height)
             )
@@ -2003,7 +2036,12 @@ def corridor_terrain(
                 platform_cursor = platform_cursor @ trimesh.transformations.translation_matrix(
                     (0.0, float(u_turn_side or 1.0) * 0.5 * cfg.corridor_width, 0.0)
                 )
-            add_platform(platform_cursor, platform_length, platform_width, component != "straight")
+            open_side = None
+            if cfg.spiral_quarter_turn:
+                if component not in ("left", "right"):
+                    raise ValueError("Spiral corridor requires exclusively left or right quarter turns.")
+                open_side = 1.0 if component == "left" else -1.0
+            add_platform(platform_cursor, platform_length, platform_width, component != "straight", open_side)
 
         # Start the outgoing stair at the appropriate edge of the middle
         # platform.  In particular, a U-turn is a switchback: its outgoing
@@ -2032,7 +2070,14 @@ def corridor_terrain(
                 # Face the outgoing stair rather than the wall at the end of
                 # the incoming direction.
                 outgoing_center = cursor.copy()
-                outgoing_center[:3, 3] = platform_centers[-1]
+                if cfg.platform_spawn_clearance is None:
+                    outgoing_center[:3, 3] = platform_centers[-1]
+                else:
+                    clearance = cfg.platform_spawn_clearance
+                    available = platform_length if component == "u_turn" else 0.5 * platform_width
+                    if not 0.0 < clearance < available:
+                        raise ValueError("Platform spawn clearance must lie inside the outgoing landing.")
+                    outgoing_center[:3, 3] -= clearance * cursor[:3, 0]
                 platform_spawn_transforms.append((outgoing_center, True))
 
         add_stairs(cursor, wall_side)
@@ -2049,6 +2094,27 @@ def corridor_terrain(
             # flight directly above an earlier one; at the easiest 5 cm step
             # height that leaves less than one metre of headroom for G1.
             u_turn_side = -float(u_turn_side or 1.0)
+
+    if cfg.spiral_quarter_turn:
+        # Center the complete spiral footprint, not its first stair entrance.
+        # Keep the tile floor and perimeter fixed; shift all stairs, rails,
+        # landings and navigation/spawn metadata together.
+        bounds = np.asarray([mesh.bounds for mesh in surface_meshes[1:]])
+        footprint_min = bounds[:, 0, :2].min(axis=0)
+        footprint_max = bounds[:, 1, :2].max(axis=0)
+        shift = np.zeros(3)
+        shift[:2] = np.array((width, length)) * 0.5 - (footprint_min + footprint_max) * 0.5
+        if np.any((footprint_max - footprint_min) >= np.array((width, length)) - 2 * cfg.wall_thickness):
+            raise ValueError("Spiral footprint does not fit inside terrain tile perimeter.")
+        for geometry in geometries[1:]:
+            geometry.geom.pos = tuple(np.asarray(geometry.geom.pos) + shift)
+        for mesh in surface_meshes[1:]:
+            mesh.apply_translation(shift)
+        for point in platform_centers:
+            point += shift
+        for transform, _ in platform_spawn_transforms:
+            transform[:3, 3] += shift
+        terrain_center += shift
 
     perimeter_specs = (
         (
@@ -2080,8 +2146,7 @@ def corridor_terrain(
             )
 
     # The first stair begins at terrain_center and initially points along +X.
-    # Put the default spawn one robot-height behind it so the policy has room
-    # to settle and approach the first step.
+    # Keep the configured approach clearance before the first step.
     origin = terrain_center - np.array((cfg.initial_spawn_backoff, 0.0, 0.0), dtype=np.float64)
     cfg.spawn_points_local = []
     cfg.spawn_yaws = []

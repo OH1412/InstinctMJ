@@ -41,14 +41,19 @@ def track_lin_vel_xy_after_height_exp(
     command_name: str,
     std: float,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    foot_height_offset: float = 0.035,
+    height_threshold: float = 0.10,
+    feet_cfg: SceneEntityCfg = SceneEntityCfg(
+        "robot", body_names=("left_ankle_roll_link", "right_ankle_roll_link")
+    ),
 ) -> torch.Tensor:
-    """Enable planar tracking only after the corridor height objective completes."""
-    height_cfg = env.reward_manager.get_term_cfg("corridor_target_height", group_name="rewards")
-    # Refresh the shared height latch before checking it: planar tracking is
-    # evaluated earlier in the reward list. The height term is idempotent.
-    height_cfg.func(env, **height_cfg.params)
-    corridor = env.command_manager.get_term(command_name).ordered_waypoint_count > 0
-    enabled = ~corridor | height_cfg.func._completed
+    """Live sole-height gate on corridors; pyramids remain always enabled."""
+    command = env.command_manager.get_term(command_name)
+    corridor = command.ordered_waypoint_count > 0
+    feet = env.scene[feet_cfg.name]
+    sole_height = feet.data.body_link_pos_w[:, feet_cfg.body_ids, 2].mean(dim=1) - foot_height_offset
+    near_height = (sole_height - command.pos_command_w[:, 2]).abs() < height_threshold
+    enabled = ~corridor | near_height
     return enabled.float() * track_lin_vel_xy_exp(env, command_name, std, asset_cfg)
 
 
@@ -210,6 +215,44 @@ def _head_yaw(
     return yaw_joint_sign * robot.data.joint_pos[:, joint_ids[0]]
 
 
+def stair_tread_pixels(hit_pos: torch.Tensor, normal_z: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+    """Conservative geometric stair evidence, not elevated-object evidence.
+
+    Require a horizontal patch at least 18 cm wide, followed in image columns
+    by another wide patch 3--21 cm higher/lower and 12--65 cm away in XY.
+    No object labels or terrain-generation metadata are used.
+    """
+    horizontal = valid & torch.isfinite(hit_pos).all(dim=-1) & (normal_z > 0.97)
+    patch = torch.zeros_like(horizontal)
+    # Metric width prevents the top of a narrow pole/rail counting as a tread.
+    # Several pixel spans retain sensitivity to both near and distant stairs.
+    for span in (2, 4, 8, 12):
+        if hit_pos.shape[2] <= span:
+            continue
+        left, right = hit_pos[:, :, :-span], hit_pos[:, :, span:]
+        width = torch.linalg.vector_norm(right[..., :2] - left[..., :2], dim=-1)
+        support = horizontal[:, :, :-span] & horizontal[:, :, span:]
+        support &= (width >= 0.18) & (width <= 0.8)
+        support &= (right[..., 2] - left[..., 2]).abs() <= 0.012
+        # All intervening rays must belong to the same nearly level patch.
+        for offset in range(1, span):
+            middle = hit_pos[:, :, offset:hit_pos.shape[2] - span + offset]
+            support &= horizontal[:, :, offset:hit_pos.shape[2] - span + offset]
+            support &= (middle[..., 2] - left[..., 2]).abs() <= 0.012
+        patch[:, :, :-span] |= support
+        patch[:, :, span:] |= support
+    stairs = torch.zeros_like(horizontal)
+    for offset in range(1, hit_pos.shape[1]):
+        near, far = hit_pos[:, :-offset], hit_pos[:, offset:]
+        rise = (far[..., 2] - near[..., 2]).abs()
+        run = torch.linalg.vector_norm(far[..., :2] - near[..., :2], dim=-1)
+        pair = patch[:, :-offset] & patch[:, offset:]
+        pair &= (rise >= 0.03) & (rise <= 0.21) & (run >= 0.12) & (run <= 0.65)
+        stairs[:, :-offset] |= pair
+        stairs[:, offset:] |= pair
+    return stairs
+
+
 def _corridor_active_vision_state(
     env: ManagerBasedRlEnv,
     command_name: str,
@@ -224,7 +267,7 @@ def _corridor_active_vision_state(
     yaw_joint_name: str,
     yaw_joint_sign: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Detect a target-height-compatible surface while standing on flat ground.
+    """Detect target-height-compatible stairs anywhere in a corridor.
 
     Returns ``(search_active, evidence, openness, follow_active,
     gaze_heading_w)``.  A short world-frame gaze-heading memory lets the torso
@@ -244,16 +287,16 @@ def _corridor_active_vision_state(
     )
     target_height_delta = command_term.pos_command_w[:, 2] - mean_sole_height
 
-    # This under-body window remains flat while the robot is searching from a
-    # platform, then switches the rewards off as soon as it steps onto stairs.
+    # Flatness gates generic scanning/openness, not visible-stair evidence.
     scanner = env.scene[scanner_name]
     hits = scanner.data.hit_pos_w
     valid_ground = (scanner.data.distances >= 0.0) & torch.isfinite(hits).all(dim=-1)
     # Dedicated camera-yaw-aligned sensor: current camera ground projection
-    # and exactly 0.25 m ahead. Both downward rays must hit valid terrain.
+    # and exactly 1 m ahead. Both downward rays must hit valid terrain.
     on_flat = valid_ground.all(dim=1) & ((hits[:, 1, 2] - hits[:, 0, 2]).abs() < 0.05)
+    env._corridor_active_vision_on_flat = on_flat
     corridor = command_term.ordered_waypoint_count > 0
-    search_active = corridor & on_flat & (torch.abs(target_height_delta) > target_height_threshold)
+    search_active = corridor & (torch.abs(target_height_delta) > target_height_threshold)
 
     camera = env.scene[terrain_camera_name]
     ray_data = camera.raycast_data
@@ -262,6 +305,9 @@ def _corridor_active_vision_state(
     normal_z = ray_data.normals_w[..., 2].reshape(env.num_envs, *image_shape)
     valid = ray_data.distances.reshape(env.num_envs, *image_shape) >= 0.0
     valid &= normal_z > 0.55  # Reject corridor walls and other near-vertical faces.
+    tread_valid = stair_tread_pixels(
+        ray_data.hit_pos_w.reshape(env.num_envs, *image_shape, 3), normal_z, valid
+    )
 
     # Prefer searching through the open center of the image.  Near-vertical
     # hits are treated as walls; ground and stair treads do not reduce the
@@ -277,7 +323,7 @@ def _corridor_active_vision_state(
     no_wall_distance = torch.full_like(center_distance, float(camera.cfg.max_distance))
     nearest_wall = torch.where(center_wall, center_distance, no_wall_distance).flatten(start_dim=1).amin(dim=1)
     openness = torch.clamp((nearest_wall - 0.6) / 1.4, min=0.0, max=1.0)
-    openness *= search_active.float()
+    openness *= (search_active & on_flat).float()
 
     desired_sign = torch.sign(target_height_delta).view(-1, 1, 1)
     signed_height = desired_sign * (hit_z - mean_sole_height.view(-1, 1, 1))
@@ -285,7 +331,7 @@ def _corridor_active_vision_state(
         (signed_height - terrain_height_threshold) / 0.30,
         min=0.0,
         max=1.0,
-    ) * valid.float()
+    ) * tread_valid.float()
     # A top-decile score detects a useful patch without letting the much larger
     # amount of ordinary flat floor dilute it to zero.
     flat_evidence = evidence_pixels.flatten(start_dim=1)
@@ -294,7 +340,7 @@ def _corridor_active_vision_state(
     evidence *= search_active.float()
     opposite_pixels = torch.clamp(
         (-signed_height - terrain_height_threshold) / 0.30, min=0.0, max=1.0
-    ) * valid.float()
+    ) * tread_valid.float()
     opposite = torch.topk(opposite_pixels.flatten(start_dim=1), k=top_k, dim=1).values.mean(dim=1)
     opposite *= search_active.float()
     # Mixed views may contain both stair directions. Reject following when
@@ -332,19 +378,16 @@ def active_vision_height_search_reward(
     scanner_name: str = "height_scanner",
     foot_height_offset: float = 0.035,
     target_height_threshold: float = 0.10,
-    terrain_height_threshold: float = 0.08,
+    terrain_height_threshold: float = 0.03,
     detection_threshold: float = 0.15,
     follow_memory_s: float = 0.6,
-    search_yaw_rate: float = 0.6,
-    search_motion_scale: float = 0.25,
-    open_space_scale: float = 0.35,
     yaw_joint_name: str = "head_yaw_joint",
     yaw_joint_sign: float = 1.0,
     asset_cfg: SceneEntityCfg = SceneEntityCfg(
         "robot", body_names=("left_ankle_roll_link", "right_ankle_roll_link")
     ),
 ) -> torch.Tensor:
-    """Encourage camera scanning, then reward seeing terrain at the target height."""
+    """Reward only visible stair evidence compatible with the target height."""
     search_active, evidence, openness, follow_active, _ = _corridor_active_vision_state(
         env,
         command_name,
@@ -359,16 +402,26 @@ def active_vision_height_search_reward(
         yaw_joint_name,
         yaw_joint_sign,
     )
-    robot: Entity = env.scene[asset_cfg.name]
-    joint_ids, _ = robot.find_joints((yaw_joint_name,), preserve_order=True)
-    yaw_rate = torch.abs(robot.data.joint_vel[:, joint_ids[0]])
-    scan_reward = search_motion_scale * torch.clamp(yaw_rate / search_yaw_rate, min=0.0, max=1.0)
-    search_reward = scan_reward + open_space_scale * openness
-    # Detection replaces the generic scan incentive, preventing endless
-    # oscillation once the relevant terrain is in view.
-    return search_active.float() * torch.where(
-        follow_active, evidence, search_reward * (1.0 - env._corridor_active_vision_wrong_height)
+    return search_active.float() * evidence
+
+
+def active_vision_open_space_reward(env: ManagerBasedRlEnv, **params) -> torch.Tensor:
+    """Separate flat-ground opening search; never counted as stair evidence."""
+    active, evidence, openness, _, _ = _corridor_active_vision_state(env, **params)
+    return active.float() * env._corridor_active_vision_on_flat.float() * (1.0 - evidence) * openness * (
+        1.0 - env._corridor_active_vision_wrong_height
     )
+
+
+def active_vision_scan_reward(env: ManagerBasedRlEnv, search_yaw_rate: float = 0.6, **params) -> torch.Tensor:
+    """Separate scanning incentive, fading once stair evidence is present."""
+    active, evidence, _, _, _ = _corridor_active_vision_state(env, **params)
+    robot = env.scene[params["asset_cfg"].name]
+    joint_ids, _ = robot.find_joints((params["yaw_joint_name"],), preserve_order=True)
+    rate = robot.data.joint_vel[:, joint_ids[0]].abs()
+    return active.float() * env._corridor_active_vision_on_flat.float() * (1.0 - evidence) * (
+        1.0 - env._corridor_active_vision_wrong_height
+    ) * (rate / search_yaw_rate).clamp(0.0, 1.0)
 
 
 def active_vision_wrong_height_penalty(
@@ -378,7 +431,7 @@ def active_vision_wrong_height_penalty(
     scanner_name: str = "camera_forward_ground",
     foot_height_offset: float = 0.035,
     target_height_threshold: float = 0.10,
-    terrain_height_threshold: float = 0.08,
+    terrain_height_threshold: float = 0.03,
     detection_threshold: float = 0.15,
     follow_memory_s: float = 0.6,
     yaw_joint_name: str = "head_yaw_joint",
@@ -387,14 +440,14 @@ def active_vision_wrong_height_penalty(
         "robot", body_names=("left_ankle_roll_link", "right_ankle_roll_link")
     ),
 ) -> torch.Tensor:
-    """Penalize viewing terrain opposite to the required ascent/descent."""
+    """Continuously penalize visible opposite-direction stairs, even off flat ground."""
     _corridor_active_vision_state(
         env, command_name, terrain_camera_name, scanner_name, asset_cfg,
         foot_height_offset, target_height_threshold, terrain_height_threshold,
         detection_threshold, follow_memory_s, yaw_joint_name, yaw_joint_sign,
     )
     opposite = env._corridor_active_vision_wrong_height
-    return torch.where(opposite >= detection_threshold, opposite, torch.zeros_like(opposite))
+    return opposite
 
 
 def active_vision_body_follow_reward(
@@ -404,7 +457,7 @@ def active_vision_body_follow_reward(
     scanner_name: str = "height_scanner",
     foot_height_offset: float = 0.035,
     target_height_threshold: float = 0.10,
-    terrain_height_threshold: float = 0.08,
+    terrain_height_threshold: float = 0.03,
     detection_threshold: float = 0.15,
     follow_memory_s: float = 0.6,
     yaw_stiffness: float = 2.0,
@@ -740,42 +793,69 @@ class delayed_stuck_penalty(ManagerTermBase):
 
 
 class corridor_target_height_exp(ManagerTermBase):
-    """Reward approaching platform height until its tolerance is first reached."""
+    """Signed live height progress; legacy name retained for config compatibility."""
 
     def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv):
         super().__init__(env)
         self._completed = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
         self._target = torch.zeros(env.num_envs, 3, device=env.device)
+        self._previous_error = torch.zeros(env.num_envs, device=env.device)
+        self._initialized = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+        self._cached_reward = torch.zeros(env.num_envs, device=env.device)
+        self._last_step = -1
 
     def reset(self, env_ids: Sequence[int] | torch.Tensor | slice | None = None) -> None:
         index = slice(None) if env_ids is None else env_ids
         self._completed[index] = False
         self._target[index] = 0.0
+        self._initialized[index] = False
+        self._cached_reward[index] = 0.0
+        self._last_step = -1
 
     def __call__(
         self,
         env: ManagerBasedRlEnv,
         command_name: str,
         std: float,
-        foot_height_offset: float = 0.035,
+        hip_height_offset: float = 0.6539980295944118,
         height_tolerance: float = 0.05,
+        progress_speed: float = 0.3,
         asset_cfg: SceneEntityCfg = SceneEntityCfg(
-            "robot", body_names=("left_ankle_roll_link", "right_ankle_roll_link")
+            "robot", body_names=("left_hip_pitch_link", "right_hip_pitch_link")
         ),
     ) -> torch.Tensor:
+        # The planar reward also calls this term to refresh the completion
+        # latch. Never consume progress twice within one control step.
+        step = int(env.common_step_counter)
+        if self._last_step == step:
+            return self._cached_reward
         command_term = env.command_manager.get_term(command_name)
         robot: Entity = env.scene[asset_cfg.name]
         target = command_term.pos_command_w
         changed = torch.linalg.vector_norm(target - self._target, dim=1) > 1.0e-4
-        self._completed[changed | (env.episode_length_buf <= 1)] = False
+        restarted = changed | (env.episode_length_buf <= 1) | ~self._initialized
+        self._completed[restarted] = False
         self._target.copy_(target)
-        mean_sole_height = (
-            torch.mean(robot.data.body_link_pos_w[:, asset_cfg.body_ids, 2], dim=1) - foot_height_offset
+        # Nominal hip-to-ground clearance keeps the target in terrain-height
+        # coordinates without swing-foot elevation leaking into progress.
+        hip_ground_height = (
+            torch.mean(robot.data.body_link_pos_w[:, asset_cfg.body_ids, 2], dim=1) - hip_height_offset
         )
-        height_error = torch.abs(mean_sole_height - target[:, 2])
-        corridor_mask = command_term.ordered_waypoint_count > 0
+        height_error = torch.abs(hip_ground_height - target[:, 2])
+        # Ignore movement inside the accepted band, but reward the final
+        # approach into it. Standing at any other height earns zero.
+        remaining_error = torch.clamp(height_error - height_tolerance, min=0.0)
+        progress = self._previous_error - remaining_error
+        active = corridor_mask = command_term.ordered_waypoint_count > 0
+        active = active & ~self._completed & ~restarted
+        self._cached_reward = active.float() * torch.clamp(
+            progress / max(progress_speed * env.step_dt, 1.0e-8), min=-1.0, max=1.0
+        )
+        self._previous_error.copy_(remaining_error)
+        self._initialized[:] = True
         self._completed |= corridor_mask & (height_error <= height_tolerance)
-        return (corridor_mask & ~self._completed).float() * torch.exp(-height_error / std)
+        self._last_step = step
+        return self._cached_reward
 
 
 def stand_still(

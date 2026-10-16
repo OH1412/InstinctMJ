@@ -22,7 +22,12 @@ instinct_mj.egg-info/
 venv/
 .vscode/
 .pytest_cache/
-/tests/
+/tests/*
+!/tests/test_visual_memory.py
+!/tests/test_stair_evidence.py
+!/tests/test_height_progress.py
+!/tests/test_spiral_terrain.py
+!/tests/test_corridor_spawn_targets.py
 # Python cache files
 __pycache__/
 *.pyc

@@ -97,6 +97,18 @@ def reset_root_state_uniform_with_terrain_spawn(
     if validate_spawn_metadata and not has_metadata_api:
         raise RuntimeError("Terrain generator does not expose per-subterrain spawn metadata.")
 
+    # Command sampling runs before forward kinematics refreshes xpos. Record
+    # the actual reset layer instead of asking commands to infer it from xpos.
+    if not hasattr(env, "_corridor_spawn_layer"):
+        env._corridor_spawn_layer = torch.full((env.num_envs,), -1, dtype=torch.long, device=env.device)
+    env._corridor_spawn_layer[env_ids] = -1
+    if has_metadata_api:
+        subterrain_cfgs = get_subterrain_cfg(terrain.terrain_levels[env_ids], terrain.terrain_types[env_ids])
+        for buffer_index, subterrain_cfg in enumerate(subterrain_cfgs):
+            if getattr(subterrain_cfg, "ordered_waypoints_local", None):
+                # Unified numbering: ground=0, first landing=1, etc.
+                env._corridor_spawn_layer[env_ids[buffer_index]] = 0
+
     if has_metadata_api and corridor_spawn_ratio > 0.0:
         subterrain_cfgs = get_subterrain_cfg(terrain.terrain_levels[env_ids], terrain.terrain_types[env_ids])
         use_platform = torch.rand(len(env_ids), device=env.device) < corridor_spawn_ratio
@@ -109,6 +121,11 @@ def reset_root_state_uniform_with_terrain_spawn(
 
             point_index = int(torch.randint(len(candidate_points), (1,), device=env.device).item())
             point = torch.tensor(candidate_points[point_index], dtype=positions.dtype, device=env.device)
+            waypoints = torch.tensor(subterrain_cfg.ordered_waypoints_local, dtype=positions.dtype, device=env.device)
+            same_height = (waypoints[:, 2] - point[2]).abs() < 1.0e-4
+            if int(same_height.sum()) != 1:
+                raise RuntimeError("Corridor spawn height must identify exactly one platform.")
+            env._corridor_spawn_layer[env_ids[buffer_index]] = same_height.nonzero()[0, 0] + 1
             env_origin = env.scene.env_origins[env_ids[buffer_index]]
             root_height = root_states[buffer_index, 2] if spawn_height_offset is None else spawn_height_offset
             positions[buffer_index, :2] = env_origin[:2] + point[:2]

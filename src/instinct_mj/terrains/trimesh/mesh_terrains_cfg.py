@@ -40,10 +40,14 @@ class MeshCorridorTerrainCfg(SubTerrainBaseCfg):
     step_tread_range: tuple[float, float] = (0.17, 0.25)
     component_types: list[str] = field(default_factory=lambda: ["u_turn"])
     first_u_turn_side: float | None = None
+    spiral_quarter_turn: bool = False
+    """Use same-handed 90-degree landings with an open outgoing edge."""
     straight_skip_mid_platform: bool = False
     enable_mid_platform_spawn: bool = True
     initial_spawn_backoff: float = 0.0
     """Distance behind the first stair used for the default terrain origin."""
+    platform_spawn_clearance: float | None = None
+    """Spawn this far before the outgoing flight; None keeps platform centers."""
     spawn_points_local: list[list[float]] = field(default_factory=list)
     """Safe platform spawn points relative to the generated terrain origin."""
     spawn_yaws: list[float] = field(default_factory=list)

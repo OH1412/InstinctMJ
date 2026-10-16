@@ -44,6 +44,12 @@ def _parkour_d455_legacy_hmv_terrain_amp_env_cfg(play: bool):
     return instinct_g1_d455_parkour_amp_legacy_hmv_terrain_cfg(play=play)
 
 
+def _parkour_d455_spiral_terrain_amp_env_cfg(play: bool):
+    from .g1_d455_parkour_cfg import instinct_g1_d455_parkour_amp_spiral_terrain_cfg
+
+    return instinct_g1_d455_parkour_amp_spiral_terrain_cfg(play=play)
+
+
 def g1_d455_parkour_amp_instinct_rl_cfg():
     from .rl_cfg import g1_d455_parkour_amp_instinct_rl_cfg as _cfg
 
@@ -98,6 +104,14 @@ register_instinct_task(
     task_id="Instinct-Parkour-Target-Amp-G1-D455-LegacyHmvTerrain-v0",
     env_cfg_factory=lambda: _parkour_d455_legacy_hmv_terrain_amp_env_cfg(play=False),
     play_env_cfg_factory=lambda: _parkour_d455_legacy_hmv_terrain_amp_env_cfg(play=True),
+    instinct_rl_cfg_factory=g1_d455_parkour_amp_instinct_rl_cfg,
+)
+
+
+register_instinct_task(
+    task_id="Instinct-Parkour-Target-Amp-G1-D455-SpiralTerrain-v0",
+    env_cfg_factory=lambda: _parkour_d455_spiral_terrain_amp_env_cfg(play=False),
+    play_env_cfg_factory=lambda: _parkour_d455_spiral_terrain_amp_env_cfg(play=True),
     instinct_rl_cfg_factory=g1_d455_parkour_amp_instinct_rl_cfg,
 )
 

@@ -71,6 +71,11 @@ class _ViewerEnvAdapter:
         self._step_count = 0
         self._debug_termination_envs = []
         self._debug_contact_data = None
+        model = self.unwrapped.sim.mj_model
+        self._goal_site_ids = [
+            mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, f"current_goal_{i}")
+            for i in range(self.num_envs)
+        ]
         if debug_termination_envs:
             self._debug_termination_envs = [int(value.strip()) for value in debug_termination_envs.split(",")]
             invalid = [env_id for env_id in self._debug_termination_envs if not 0 <= env_id < self.num_envs]
@@ -92,10 +97,27 @@ class _ViewerEnvAdapter:
 
     def get_observations(self):
         obs, _ = self._vec_env.get_observations()
+        self._sync_goal_sites()
         return obs
+
+    def _sync_goal_sites(self):
+        if not self._goal_site_ids or min(self._goal_site_ids) < 0:
+            return
+        env = self.unwrapped
+        term = env.command_manager.get_term("base_velocity")
+        targets = getattr(term, "pos_command_w", None)
+        if targets is None:
+            return
+        positions = targets.detach().clone()
+        positions[:, 2] += 0.06
+        # World sites are render-only: update the CPU render model and the
+        # current data, without altering collisions, actions or observations.
+        env.sim.mj_model.site_pos[self._goal_site_ids] = positions.cpu().numpy()
+        env.sim.data.site_xpos[:, self._goal_site_ids] = positions.unsqueeze(0)
 
     def step(self, actions):
         result = self._vec_env.step(actions)
+        self._sync_goal_sites()
         self._step_count += 1
         if self._debug_termination_envs:
             env = self.unwrapped
@@ -156,7 +178,7 @@ def _resolve_viewer_backend(viewer: str) -> str:
     return "native" if has_display else "viser"
 
 
-def _disable_headless_debug_visualization(env_cfg) -> None:
+def _disable_headless_debug_visualization(env_cfg, *, keep_command_debug_vis: bool = False) -> None:
     """Disable GUI-dependent debug visualizations for headless play runs."""
     scene = getattr(env_cfg, "scene", None)
     if scene is not None:
@@ -168,7 +190,7 @@ def _disable_headless_debug_visualization(env_cfg) -> None:
                 sensor_cfg.debug_vis = False
 
     commands = getattr(env_cfg, "commands", None)
-    if isinstance(commands, dict):
+    if isinstance(commands, dict) and not keep_command_debug_vis:
         for command_cfg in commands.values():
             if getattr(command_cfg, "debug_vis", None) is not None:
                 command_cfg.debug_vis = False
@@ -563,10 +585,25 @@ def run_play(task_id: str, cfg: PlayConfig) -> None:
 
     has_display = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
     if viewer_backend != "native" or not has_display:
-        _disable_headless_debug_visualization(env_cfg)
+        _disable_headless_debug_visualization(env_cfg, keep_command_debug_vis=viewer_backend == "viser")
 
     if cfg.num_envs is not None:
         env_cfg.scene.num_envs = cfg.num_envs
+    if viewer_backend == "viser":
+        original_spec_fn = env_cfg.scene.spec_fn
+        goal_count = env_cfg.scene.num_envs
+
+        def _add_current_goal_sites(spec):
+            if original_spec_fn is not None:
+                original_spec_fn(spec)
+            for i in range(goal_count):
+                spec.worldbody.add_site(
+                    name=f"current_goal_{i}", type=mujoco.mjtGeom.mjGEOM_CYLINDER,
+                    size=(0.18, 0.06, 0.0), rgba=(1.0, 0.1, 0.1, 0.85),
+                    group=4, pos=(0.0, 0.0, -100.0),
+                )
+
+        env_cfg.scene.spec_fn = _add_current_goal_sites
     if cfg.video_height is not None:
         env_cfg.viewer.height = cfg.video_height
     if cfg.video_width is not None:

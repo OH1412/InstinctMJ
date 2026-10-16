@@ -270,9 +270,25 @@ class PoseVelocityCommand(CommandTerm):
                     height_error = torch.abs(waypoint_z - sole_z[:, None])
                     layer_distance = torch.where(valid, height_error + 0.001 * distances, torch.inf)
                     spawn_index = layer_distance.argmin(dim=1)
+                    recorded_layer = getattr(self._env, "_corridor_spawn_layer", None)
+                    if recorded_layer is None and all(offset > 0 for offset in self.cfg.corridor_target_layer_offsets):
+                        raise RuntimeError("Ascent-only corridor targets require recorded reset layer metadata.")
+                    if recorded_layer is not None:
+                        reset_layers = recorded_layer[reset_env_ids]
+                        if ((reset_layers < 0) | (reset_layers >= self.ordered_waypoint_count[reset_env_ids])).any():
+                            raise RuntimeError("Missing or invalid corridor reset layer metadata.")
+                        spawn_index = reset_layers
                     offsets = torch.tensor(self.cfg.corridor_target_layer_offsets, device=self.device)
                     candidates = spawn_index[:, None] + offsets[None, :]
                     legal = (candidates >= 0) & (candidates < self.ordered_waypoint_count[reset_env_ids, None])
+                    if all(offset > 0 for offset in self.cfg.corridor_target_layer_offsets):
+                        # Explicit ascent-only profile: never silently select
+                        # an invalid/same/lower platform if no candidate exists.
+                        candidate_z = waypoint_z.gather(1, candidates.clamp(0, waypoint_z.shape[1] - 1))
+                        spawn_z = waypoint_z.gather(1, spawn_index[:, None])
+                        legal &= candidate_z > spawn_z + 1.0e-4
+                    if not legal.any(dim=1).all():
+                        raise RuntimeError("Corridor spawn has no legal target layer; check spawn/target metadata.")
                     choices = torch.rand(candidates.shape, device=self.device).masked_fill(~legal, -1.0).argmax(dim=1)
                     self.ordered_waypoint_index[reset_env_ids] = candidates.gather(1, choices[:, None]).squeeze(1)
 

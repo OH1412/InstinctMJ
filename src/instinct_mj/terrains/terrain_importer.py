@@ -772,11 +772,29 @@ class TerrainImporter(TerrainImporterBase):
             # In case of None override, we don't need to do anything
             return
         super().configure_env_origins(origins)
+        gen_cfg = self.cfg.terrain_generator
+        active_columns = None
+        if origins is not None and gen_cfg is not None and gen_cfg.curriculum:
+            weights = np.asarray([c.proportion for c in gen_cfg.sub_terrains.values()], dtype=float)
+            if len(weights) == self.terrain_origins.shape[1]:
+                active_columns = np.flatnonzero(weights > 0)
+                if not len(active_columns):
+                    raise ValueError("At least one terrain must have a positive proportion.")
+                if not self.cfg.deterministic_atlas_origins:
+                    ideal = weights / weights.sum() * self.cfg.num_envs
+                    counts = np.floor(ideal).astype(int)
+                    order = active_columns[np.argsort(-(ideal - counts)[active_columns])]
+                    counts[order[:self.cfg.num_envs - counts.sum()]] += 1
+                    self.terrain_types = torch.as_tensor(np.repeat(np.arange(len(weights)), counts), device=self._device, dtype=torch.long)
+                    self.env_origins = self.terrain_origins[self.terrain_levels, self.terrain_types]
         if origins is None or not self.cfg.deterministic_atlas_origins:
             return
 
         assert self.terrain_origins is not None
         num_rows, num_cols = self.terrain_origins.shape[:2]
+        if active_columns is None:
+            active_columns = np.arange(num_cols)
+        num_cols = len(active_columns)
         num_patches = num_rows * num_cols
         if self.cfg.num_envs > num_patches:
             raise ValueError(
@@ -788,5 +806,6 @@ class TerrainImporter(TerrainImporterBase):
         # followed by the same columns at each successively harder level.
         env_ids = torch.arange(self.cfg.num_envs, device=self._device, dtype=torch.long)
         self.terrain_levels = torch.div(env_ids, num_cols, rounding_mode="floor")
-        self.terrain_types = torch.remainder(env_ids, num_cols)
+        active = torch.as_tensor(active_columns, device=self._device, dtype=torch.long)
+        self.terrain_types = active[torch.remainder(env_ids, num_cols)]
         self.env_origins = self.terrain_origins[self.terrain_levels, self.terrain_types]
