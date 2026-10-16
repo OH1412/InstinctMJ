@@ -1,0 +1,127 @@
+seed: 42
+device: cuda:0
+num_steps_per_env: 24
+max_iterations: 300000
+policy:
+  class_name: EncoderMoEActorCritic
+  init_noise_std: 1.0
+  actor_hidden_dims:
+  - 256
+  - 128
+  - 64
+  critic_hidden_dims:
+  - 256
+  - 128
+  - 64
+  activation: elu
+  num_moe_experts: 4
+  moe_gate_hidden_dims: []
+  encoder_configs:
+    depth_encoder:
+      class_name: Conv2dHeadModel
+      component_names:
+      - depth_image
+      output_size: 128
+      takeout_input_components: true
+      channels:
+      - 4
+      kernel_sizes:
+      - 3
+      strides:
+      - 1
+      hidden_sizes:
+      - 256
+      - 256
+      paddings:
+      - 1
+      nonlinearity: ReLU
+      use_maxpool: true
+  critic_encoder_configs:
+    depth_encoder:
+      class_name: Conv2dHeadModel
+      component_names:
+      - depth_image
+      output_size: 128
+      takeout_input_components: true
+      channels:
+      - 4
+      kernel_sizes:
+      - 3
+      strides:
+      - 1
+      hidden_sizes:
+      - 256
+      - 256
+      paddings:
+      - 1
+      nonlinearity: ReLU
+      use_maxpool: true
+  vae_encoder_kwargs: null
+  vae_decoder_kwargs: null
+  vae_latent_size: null
+  vae_input_subobs_components: null
+  vae_aux_subobs_components: null
+algorithm:
+  class_name: WasabiPPO
+  value_loss_coef: 1.0
+  use_clipped_value_loss: true
+  clip_param: 0.2
+  entropy_coef: 0.006
+  num_learning_epochs: 5
+  num_mini_batches: 4
+  learning_rate: 0.0003
+  optimizer_class_name: AdamW
+  schedule: adaptive
+  gamma: 0.99
+  lam: 0.95
+  advantage_mixing_weights: 1.0
+  desired_kl: 0.01
+  max_grad_norm: 1.0
+  clip_min_std: 1.0e-12
+  kl_loss_func: null
+  kl_loss_coef: null
+  using_ppo: null
+  teacher_policy_class_name: null
+  teacher_policy: null
+  teacher_logdir: null
+  label_action_with_critic_obs: null
+  teacher_act_prob: null
+  update_times_scale: null
+  distillation_loss_coef: null
+  distill_target: null
+  actor_state_key: null
+  reference_state_key: null
+  discriminator_class_name: null
+  discriminator_kwargs:
+    hidden_sizes:
+    - 1024
+    - 512
+    nonlinearity: ReLU
+  discriminator_optimizer_class_name: AdamW
+  discriminator_optimizer_kwargs:
+    lr: 0.0001
+    betas:
+    - 0.9
+    - 0.999
+  discriminator_reward_coef: 0.25
+  discriminator_reward_type: quad
+  discriminator_loss_func: MSELoss
+  discriminator_loss_coef: null
+  discriminator_gradient_penalty_coef: 5.0
+  discriminator_weight_decay_coef: 0.0003
+  discriminator_logit_weight_decay_coef: 0.04
+  discriminator_gradient_torlerance: null
+  discriminator_backbone_gradient_only: null
+normalizers: {}
+save_interval: 50
+log_interval: 1
+experiment_name: g1_d455_parkour
+run_name: flat_two_point1m_resume46200
+resume: true
+load_run: /home/descfly/humanoid_robot/InstinctMJ/logs/instinct_rl/g1_d455_parkour/2026-10-16_13-12-17_open_ground1m_resume46150
+load_checkpoint: model_46200.pt
+ckpt_manipulator: null
+ckpt_manipulator_kwargs: {}
+policy_observation_group: policy
+critic_observation_group: critic
+empirical_normalization: false
